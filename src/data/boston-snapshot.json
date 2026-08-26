@@ -1,0 +1,59 @@
+{
+  "_comment": "Offline snapshot of representative Boston street-sweeping blocks. Used by the demo MockProvider and as BostonProvider's fallback when Analyze Boston / ArcGIS is unreachable. Coordinates are approximate block centroids. Rules encode the published sweeping pattern; weekday is 0=Sun..6=Sat. Season is Boston's Apr 1 - Nov 30 window. Refreshed from the SweepAlert design seed data.",
+  "timezone": "America/New_York",
+  "season": { "startMonth": 4, "startDay": 1, "endMonth": 11, "endDay": 30 },
+  "blocks": [
+    {
+      "blockId": "bos-beacon-112-even",
+      "lat": 42.35618,
+      "lng": -71.07079,
+      "address": "112 Beacon St",
+      "blockLabel": "Beacon Hill · even side, Charles → Brimmer",
+      "scheduleLabel": "Cleaned every Thursday, 8am–12pm",
+      "seasonLabel": "APR 1 – NOV 30 · TOW ZONE",
+      "side": "even",
+      "windowStart": "08:00",
+      "windowEnd": "12:00",
+      "rules": [{ "weekday": 4, "weeksOfMonth": [] }]
+    },
+    {
+      "blockId": "bos-marlborough-34-odd",
+      "lat": 42.35168,
+      "lng": -71.07360,
+      "address": "34 Marlborough St",
+      "blockLabel": "Back Bay · odd side, Arlington → Berkeley",
+      "scheduleLabel": "Cleaned 1st & 3rd Monday, 8am–12pm",
+      "seasonLabel": "APR 1 – NOV 30 · TICKET $90",
+      "side": "odd",
+      "windowStart": "08:00",
+      "windowEnd": "12:00",
+      "rules": [{ "weekday": 1, "weeksOfMonth": [1, 3] }]
+    },
+    {
+      "blockId": "bos-wbroadway-218-south",
+      "lat": 42.34190,
+      "lng": -71.05100,
+      "address": "218 W Broadway",
+      "blockLabel": "South Boston · south side, Dorchester → C St",
+      "scheduleLabel": "Cleaned 2nd & 4th Tuesday, 9am–1pm",
+      "seasonLabel": "APR 1 – NOV 30 · TOW ZONE",
+      "side": "south",
+      "windowStart": "09:00",
+      "windowEnd": "13:00",
+      "rules": [{ "weekday": 2, "weeksOfMonth": [2, 4] }]
+    },
+    {
+      "blockId": "bos-silver-74-odd",
+      "lat": 42.33690,
+      "lng": -71.04780,
+      "address": "74 Silver St",
+      "blockLabel": "South Boston · odd side, Dorchester → E St",
+      "scheduleLabel": "Cleaned every Friday, 8am–12pm",
+      "seasonLabel": "APR 1 – NOV 30 · TICKET $90",
+      "side": "odd",
+      "windowStart": "08:00",
+      "windowEnd": "12:00",
+      "rules": [{ "weekday": 5, "weeksOfMonth": [] }]
+    }
+  ]
+}

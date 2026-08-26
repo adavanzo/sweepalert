@@ -1,0 +1,53 @@
+{
+  "expo": {
+    "name": "SweepAlert",
+    "slug": "sweepalert",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "sweepalert",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "backgroundColor": "#efeeea"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.sweepalert.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "SweepAlert uses your location to detect the street-cleaning schedule for the block where you parked.",
+        "NFCReaderUsageDescription": "SweepAlert reads your parked-car NFC tag to save your spot when you tap your phone to it."
+      }
+    },
+    "android": {
+      "package": "com.sweepalert.app",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "NFC",
+        "POST_NOTIFICATIONS",
+        "SCHEDULE_EXACT_ALARM"
+      ]
+    },
+    "plugins": [
+      "expo-location",
+      [
+        "expo-notifications",
+        {
+          "color": "#6a5cd6"
+        }
+      ],
+      [
+        "react-native-nfc-manager",
+        {
+          "nfcPermission": "SweepAlert reads your parked-car NFC tag to save your spot."
+        }
+      ]
+    ],
+    "extra": {
+      "bostonCkanBase": "https://data.boston.gov/api/3/action",
+      "bostonSweepingResourceId": "9fdbdcad-67c8-4b23-b6ec-861e77d56227",
+      "bostonSamSegmentsUrl": "https://gisportal.boston.gov/arcgis/rest/services/SAM/Live_SAM_Address/FeatureServer/3/query",
+      "bostonNeighborhoodsUrl": "https://gis.bostonplans.org/hosting/rest/services/Hosted/Boston_Neighborhood_Boundaries/FeatureServer/5/query"
+    }
+  }
+}

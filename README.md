@@ -1,0 +1,262 @@
+# SweepAlert 🧹🚗
+
+A cross-platform mobile app that reminds you to move your car before street
+cleaning. Built with **React Native + Expo + TypeScript**. Ships with a seeded
+**Boston** demo so it runs end-to-end with **zero external setup**.
+
+> Imported from the SweepAlert Claude Design (`SweepAlert.dc.html`) — the light/
+> dark tokens, Plus Jakarta Sans / IBM Plex Mono typography, and all seven
+> screens are reproduced faithfully in native components.
+
+---
+
+## Quick start
+
+```bash
+cd SweepAlert
+npm install
+
+# start the Metro bundler
+npm start
+# then press  i  (iOS simulator)   or   a  (Android emulator)
+# or scan the QR code with Expo Go on a physical device
+```
+
+Run the scheduling-engine unit tests and the type checker:
+
+```bash
+npm test        # jest — scheduling engine (DST + season + fire times)
+npm run typecheck
+```
+
+### What works where
+
+| Capability | Expo Go (simulator/phone) | Dev build on device |
+|---|---|---|
+| Cars, reminders, schedules, notifications | ✅ | ✅ |
+| Map + draggable pin (`react-native-maps`) | ✅ | ✅ |
+| GPS capture + reverse-geocode (`expo-location`) | ✅ | ✅ |
+| Local notifications (`expo-notifications`) | ✅ (device) | ✅ |
+| **NFC tag tap** (`react-native-nfc-manager`) | ❌ feature-detected → GPS fallback | ✅ (NFC phone) |
+
+NFC is a native module absent from Expo Go and simulators. The app
+**feature-detects** it (`src/services/nfc.ts` → `isSupported()`) and degrades to
+GPS with a clear message, so nothing breaks. To exercise NFC for real:
+
+```bash
+npx expo run:ios      # or: npx expo run:android  (physical NFC device)
+```
+
+---
+
+## Architecture
+
+```
+SweepAlert/
+├── App.tsx                     # providers + navigation container
+├── index.ts                    # Expo entry
+├── app.json                    # permissions, plugins, ArcGIS endpoint slots
+├── __tests__/
+│   ├── scheduling.test.ts      # engine unit tests (DST, season, fire times)
+│   └── bostonMapping.test.ts   # live CKAN row -> schedule translation
+└── src/
+    ├── types.ts                # Car / ParkingSpot / CleaningSchedule / Reminder
+    ├── theme/
+    │   ├── tokens.ts           # design tokens (light/dark) from the design
+    │   └── ThemeContext.tsx
+    ├── data/                   # ── schedule providers ──
+    │   ├── boston-snapshot.json  # bundled offline Boston blocks
+    │   ├── snapshot.ts           # nearest-block + schedule builders
+    │   └── providers/
+    │       ├── types.ts          # StreetCleaningProvider interface
+    │       ├── BostonProvider.ts # live Analyze Boston lookup + offline fallback
+    │       ├── bostonApi.ts      # CKAN datastore client + config
+    │       ├── bostonMapping.ts  # pure row -> CleaningSchedule (unit-tested)
+    │       ├── MockProvider.ts   # pure offline demo data
+    │       └── index.ts          # provider registry
+    ├── services/              # ── engine + device ──
+    │   ├── scheduling.ts         # getNextCleaning / computeFireTimes (luxon)
+    │   ├── presets.ts            # reminder presets
+    │   ├── format.ts             # countdown / status / upcoming view-models
+    │   ├── location.ts           # expo-location + reverse-geocode
+    │   ├── nfc.ts                # feature-detected NFC
+    │   ├── notifications.ts      # expo-notifications schedule/cancel/sync
+    │   └── seed.ts               # seeded demo cars
+    ├── state/
+    │   └── store.ts              # Zustand + AsyncStorage; owns reschedule glue
+    ├── components/             # Screen, Button, Card, Toggle, Pill, …
+    ├── navigation/            # bottom tabs + Cars stack, custom pill tab bar
+    └── screens/               # MyCars, Park, CarDetail, ReminderEditor,
+                               # ManageCars, Alerts, Settings
+```
+
+### The scheduling engine (`src/services/scheduling.ts`)
+
+Pure, dependency-light (luxon only), and fully unit-tested. All wall-clock math
+runs in the schedule's IANA timezone so it is DST-correct.
+
+```ts
+getNextCleaning(schedule, from): Date | null   // next sweep after `from`
+computeFireTimes(schedule, cleaning, reminders, now): FireTime[]  // notif times
+```
+
+- **Recurrence** — a `CleaningRule` is `{ weekday, weeksOfMonth }`. Empty
+  `weeksOfMonth` = "every Thursday"; `[1, 3]` = "1st & 3rd Monday".
+- **Season** — inclusive on/off window; Boston is Apr 1 – Nov 30. Off-season
+  days are skipped and the engine rolls forward to next April.
+- **DST** — a sweep at "08:00 local" stays 08:00 across the spring-forward and
+  fall-back boundaries; "night before at 8pm" reminders likewise (see tests).
+- **Roll-forward** — reminders reschedule automatically after each event passes
+  and whenever a car is moved (`store.refreshCar` → `notifications.syncCarNotifications`).
+
+Run `npm test` to see the DST / season / fire-time cases.
+
+---
+
+## Pluggable schedule providers
+
+Every city implements one interface (`src/data/providers/types.ts`):
+
+```ts
+interface StreetCleaningProvider {
+  getScheduleForLocation(lat: number, lng: number): Promise<CleaningSchedule | null>;
+  getNextCleaning(schedule: CleaningSchedule, from: Date): Date | null;
+}
+```
+
+- **`BostonProvider`** (reference) is wired to the **live public dataset** on
+  [Analyze Boston](https://data.boston.gov/dataset/street-sweeping-schedules)
+  (`data.boston.gov`), served via CKAN's datastore API — **no API key**. It
+  **falls back to the bundled snapshot** when the network is unreachable or a
+  street isn't in the dataset, so the app is always demoable offline.
+- **`ReCollectProvider`** covers cities whose schedule lives in **ReCollect**
+  (recollect.net) rather than open data — currently **Cambridge**. Cambridge
+  sweeps monthly (Apr–Dec), odd/even sides on different days, and ReCollect
+  publishes a concrete, holiday-adjusted calendar per address. Flow:
+  reverse-geocode → ReCollect `address-suggest` (place_id) → `events` (dated,
+  per side); the parked parcel's house-number parity selects the side. These
+  concrete dates are stored as `explicitDates` on the schedule, which the engine
+  uses directly (`src/data/providers/recollect.ts`, mapping in
+  `recollectMapping.ts`). ⚠️ ReCollect's API is unofficial — every call fails
+  soft to "no data for this location". (Somerville uses ReCollect too; its
+  service id is still TODO.)
+- **`MockProvider`** serves the bundled snapshot only (tests + first-run demo).
+
+**Multi-city router.** `getProvider()` returns a `GreaterBostonProvider` that
+reverse-geocodes the point to a city and delegates: `Cambridge → ReCollect`,
+everything else → Boston (which self-gates to its real boundary and returns
+`null` outside). Add a city by implementing the interface and adding one route.
+
+### How the live Boston lookup works
+
+The sweeping dataset is **tabular, keyed by street name** (columns `st_name`,
+`side`, `from`/`to`, `start_time`/`end_time`, day flags `monday…sunday`, week
+flags `week_1…week_5`, `year_round`) — it has **no lat/lng geometry**. A plain
+reverse-geocode of the pin can therefore snap to a *parallel* street and pick
+the wrong block/side. So resolution is **geometry-first**
+(`src/data/providers/BostonProvider.ts`):
+
+1. **Snap to the road** — query Boston's live **SAM street-segments** ArcGIS
+   layer (`samSegments.ts`) for the segment nearest the pin. Its geometry gives
+   the *actual* nearest street, and its per-side address parity (`L_F_ADD` /
+   `R_F_ADD`) + the point's side of the polyline gives the **even/odd side**.
+   (Falls back to `expo-location` reverse-geocode if SAM is unreachable.)
+2. **Pin the neighborhood** — point-in-polygon against Boston's **BPDA
+   neighborhood boundaries** (`bostonNeighborhoods.ts`) resolves *which* Back Bay
+   / Jamaica Plain / … you're in. (Boylston St, for instance, is swept daily
+   12:01–7am in Back Bay but 8am–12pm in Jamaica Plain.)
+3. **Look up the schedule** — `datastore_search?resource_id=…&q=<street>`, then
+   `pickRow` narrows by **side**, then scores each block by **neighborhood +
+   nearby cross streets** and takes the best. Neighborhood is weighted above a
+   lone cross street so a same-neighborhood block always beats a name
+   coincidence elsewhere. The pure geometry math is unit-tested in
+   `samGeometry.ts` / `__tests__/samSegments.test.ts`; the scoring in
+   `__tests__/bostonMapping.test.ts`.
+
+If SAM ever names the wrong street (dense corners), the Park screen surfaces a
+**"Wrong street?"** control listing nearby streets, and
+`BostonProvider.getScheduleForStreet()` re-resolves the schedule for the one you
+pick.
+
+> **Block precision.** SAM fixes the street + side reliably. Pinning the exact
+> *block* within a street is still best-effort (the sweeping dataset has no
+> geometry to join on), but per-side rules rarely vary block-to-block, so the
+> resolved cleaning times/days/season are correct in practice.
+
+The raw row → `CleaningSchedule` translation is pure and unit-tested in
+`src/data/providers/bostonMapping.ts` (see `__tests__/bostonMapping.test.ts`):
+`week_2 & week_4` → `weeksOfMonth: [2,4]`, all-weeks → "every", `Even/Odd` →
+`side`, `year_round` flips the season between year-round and Apr 1 – Nov 30.
+
+**It already points at the real endpoint** (`app.json` → `expo.extra`):
+
+```json
+"extra": {
+  "bostonCkanBase": "https://data.boston.gov/api/3/action",
+  "bostonSweepingResourceId": "9fdbdcad-67c8-4b23-b6ec-861e77d56227"
+}
+```
+
+Override those to target a mirror or an updated resource id — no code change.
+
+> **Segment precision caveat.** Because the open dataset has no geometry, a
+> street with several segments (different sides / cross-street ranges) can't be
+> pinned to the exact block from GPS alone — the provider picks the best match by
+> street + neighborhood. Boston also publishes a geometric
+> [Street Segments (SAM)](https://data.boston.gov/dataset/boston-street-segments-sam-system)
+> layer; joining sweeping rows to SAM segment geometry would make block-level
+> disambiguation exact, and is the natural next step.
+
+### Adding a new city
+
+1. Create `src/data/providers/<City>Provider.ts` implementing
+   `StreetCleaningProvider`. Reuse `getNextCleaning` from
+   `src/services/scheduling.ts` — the engine is city-agnostic.
+2. Register it in `src/data/providers/index.ts` and set `ACTIVE_PROVIDER_ID`.
+3. (Optional) Ship a `<city>-snapshot.json` for an offline fallback, mirroring
+   `boston-snapshot.json`.
+
+---
+
+## Data model (persisted via AsyncStorage)
+
+```ts
+Car            { id, name, color, plate, location?, schedule?, nextCleaning?, reminders, createdAt }
+ParkingSpot    { carId, lat, lng, address, blockId, savedAt }
+CleaningSchedule { blockId, rules, windowStart, windowEnd, side, season, timezone, …labels }
+Reminder       { id, carId, label, offsetMinutes, timeOfDayOverride?, channel, enabled, notificationId? }
+```
+
+Zustand persists only the durable domain data; schedules, next-cleaning times,
+and OS notification IDs are recomputed on launch by `store.init()`.
+
+---
+
+## Permissions & denied-state handling
+
+- **Location** and **Notifications** are requested lazily with clear prompts;
+  Settings shows live status and a one-tap "Enable". Denied states never crash —
+  Park still works via the draggable pin, and scheduling silently no-ops until
+  notifications are granted.
+- iOS usage strings and Android permissions are declared in `app.json`.
+
+---
+
+## Demo tips
+
+- **Settings → Start with no cars** toggles the first-run empty state.
+- **Alerts → Preview a push notification** fires a real local notification
+  (grant notifications first; use a physical device — simulators don't alert).
+- Countdowns tick live; the seeded Subaru is parked on a block that sweeps very
+  soon, so it shows the red **Move now / Move soon** states.
+
+---
+
+## Notes on versions
+
+Pinned to **Expo SDK 51** for broad stability. If your installed Expo differs,
+align native deps with:
+
+```bash
+npx expo install --check
+```
