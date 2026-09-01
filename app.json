@@ -29,6 +29,7 @@
       ]
     },
     "plugins": [
+      "./plugins/withFreeTeamSigning",
       "expo-location",
       [
         "expo-notifications",
