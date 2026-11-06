@@ -19,6 +19,7 @@ export function MyCarsScreen({ navigation }: Props) {
   const now = useNow();
   const cars = useStore((s) => s.cars);
   const showEmpty = useStore((s) => s.showEmpty);
+  const loadError = useStore((s) => s.loadError);
 
   const views = useMemo(
     () => (showEmpty ? [] : cars.map((car) => decorateCar(car, now, c))),
@@ -59,7 +60,17 @@ export function MyCarsScreen({ navigation }: Props) {
         </Pressable>
       </View>
 
-      {views.length === 0 ? (
+      {loadError ? (
+        // Saved state failed to load; the store blocks writes and retries on
+        // foreground (state/store.ts onAppActive), so this clears by itself.
+        <View style={{ paddingVertical: 10, paddingHorizontal: 14, borderRadius: 14, backgroundColor: c.warnT }}>
+          <T style={{ fontSize: 13, fontWeight: '600', color: c.warn }}>Couldn&apos;t load your saved cars. Retrying…</T>
+        </View>
+      ) : null}
+
+      {loadError && views.length === 0 ? null : views.length === 0 ? (
+        // (No add/park prompts while saved state is unreadable: the store
+        // refuses those until a retry succeeds.)
         <EmptyState onPark={() => navigation.getParent<BottomTabNavigationProp<RootTabParamList>>()?.navigate('Park', { autoLocate: Date.now() })} onAdd={() => navigation.navigate('ManageCars')} />
       ) : (
         <>

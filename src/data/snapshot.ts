@@ -58,6 +58,24 @@ export function nearestBlock(lat: number, lng: number): SnapshotBlock {
   return { ...best, distanceKm: bestD };
 }
 
+/**
+ * How close (km) a point must be to a snapshot block for the offline fallback
+ * to use it. The snapshot only holds a handful of blocks, so anything farther
+ * would be a schedule for a different street — i.e. made-up data. ~100 m covers
+ * GPS jitter around a block centroid (and the seeded demo cars, which are
+ * parked exactly on snapshot coordinates).
+ */
+export const SNAPSHOT_MAX_KM = 0.1;
+
+/**
+ * Offline fallback: the snapshot schedule for this point if a snapshot block is
+ * within SNAPSHOT_MAX_KM, otherwise null (no data beats wrong data).
+ */
+export function snapshotFallback(lat: number, lng: number): CleaningSchedule | null {
+  const block = nearestBlock(lat, lng);
+  return (block.distanceKm ?? Infinity) <= SNAPSHOT_MAX_KM ? toSchedule(block) : null;
+}
+
 export function blockById(blockId: string): RawBlock | undefined {
   return SNAPSHOT.blocks.find((b) => b.blockId === blockId);
 }

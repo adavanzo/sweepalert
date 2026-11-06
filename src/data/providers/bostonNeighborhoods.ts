@@ -8,6 +8,8 @@
  */
 import Constants from 'expo-constants';
 
+import { fetchWithTimeout } from '../../services/http';
+
 export const DEFAULT_NEIGHBORHOODS_URL =
   'https://gis.bostonplans.org/hosting/rest/services/Hosted/Boston_Neighborhood_Boundaries/FeatureServer/5/query';
 
@@ -27,7 +29,7 @@ export async function neighborhoodAt(lat: number, lng: number): Promise<string |
     outFields: 'name',
     returnGeometry: 'false',
   });
-  const res = await fetch(`${url()}?${params.toString()}`);
+  const res = await fetchWithTimeout(`${url()}?${params.toString()}`);
   if (!res.ok) throw new Error(`Neighborhoods HTTP ${res.status}`);
   const json = (await res.json()) as {
     features?: { attributes?: { name?: string } }[];

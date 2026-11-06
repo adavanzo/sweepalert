@@ -8,7 +8,7 @@
  */
 import { DateTime } from 'luxon';
 
-import { CleaningRule, CleaningSchedule, Reminder, Season } from '../types';
+import { Car, CleaningRule, CleaningSchedule, Reminder, Season } from '../types';
 
 const SEARCH_HORIZON_DAYS = 420; // > 1 year, so a yearly season is always found
 
@@ -78,11 +78,16 @@ export function getNextCleaning(schedule: CleaningSchedule, from: Date): Date | 
 /**
  * The instant a reminder should fire for a given cleaning datetime.
  *
- *  - offsetMinutes is subtracted from the cleaning instant.
+ *  - offsetMinutes is subtracted from the cleaning instant. Whole days
+ *    (offsetMinutes / 1440) are subtracted as calendar days in the schedule's
+ *    zone and the remainder as elapsed minutes, so "1 day before" an 8:00 sweep
+ *    is 8:00 the previous day even across a DST change (not 7:00 or 9:00).
  *  - if timeOfDayOverride ("HH:mm") is set, the resulting day's clock time is
  *    pinned to it (this is how "night before at 8pm" works: 1 day offset, then
  *    the clock forced to 20:00). The override is applied in the schedule's zone
  *    so it survives DST.
+ *
+ * See services/reminderTiming.ts for the editor's model of these two fields.
  */
 export function computeFireTime(
   schedule: CleaningSchedule,
@@ -90,7 +95,9 @@ export function computeFireTime(
   reminder: Pick<Reminder, 'offsetMinutes' | 'timeOfDayOverride'>,
 ): Date {
   const zone = schedule.timezone;
-  let dt = DateTime.fromJSDate(cleaning, { zone }).minus({ minutes: reminder.offsetMinutes });
+  const days = Math.floor(reminder.offsetMinutes / 1440);
+  const minutes = reminder.offsetMinutes - days * 1440;
+  let dt = DateTime.fromJSDate(cleaning, { zone }).minus({ days }).minus({ minutes });
   if (reminder.timeOfDayOverride) {
     const [h, m] = reminder.timeOfDayOverride.split(':').map((n) => parseInt(n, 10));
     dt = dt.set({ hour: h, minute: m, second: 0, millisecond: 0 });
@@ -106,7 +113,7 @@ export interface FireTime {
 }
 
 /**
- * Fire times for every reminder on a car, relative to the next cleaning.
+ * Fire times for every reminder on a car, relative to one cleaning.
  * Disabled reminders are skipped. Callers typically schedule only `!past` ones.
  */
 export function computeFireTimes(
@@ -122,4 +129,106 @@ export function computeFireTimes(
       const fireAt = computeFireTime(schedule, cleaning, reminder);
       return { reminder, fireAt, past: fireAt.getTime() <= nowMs };
     });
+}
+
+/**
+ * The next `count` cleanings strictly after `from`, soonest first. Works for
+ * both rules-based and explicitDates schedules by stepping getNextCleaning
+ * forward from each result (so season wrap-around rolls into next April).
+ */
+export function getUpcomingCleanings(schedule: CleaningSchedule, from: Date, count: number): Date[] {
+  const out: Date[] = [];
+  let cursor = from;
+  while (out.length < count) {
+    const next = getNextCleaning(schedule, cursor);
+    if (!next) break;
+    out.push(next);
+    cursor = next;
+  }
+  return out;
+}
+
+/**
+ * How many upcoming cleanings each car's reminders are scheduled for. Pre-
+ * scheduling a few sweeps means alerts keep firing even if the user never
+ * reopens the app (each launch/refresh rolls the window forward again).
+ */
+export const CLEANINGS_AHEAD = 3;
+
+/** iOS keeps only the 64 soonest pending local notifications per app. */
+export const IOS_PENDING_LIMIT = 64;
+
+/**
+ * Upper bound on pending OS notifications per car. iOS silently drops anything
+ * past IOS_PENDING_LIMIT, so we keep the soonest few per car rather than let a
+ * single car with many reminders crowd out the others. With more than 4 cars
+ * the effective cap shrinks further (see perCarCap).
+ */
+export const MAX_PER_CAR = 16;
+
+/**
+ * Most cars the app tracks. perCarCap floors at 1 alert per car, so past 64
+ * cars the total would exceed IOS_PENDING_LIMIT; 16 keeps every car at >= 4
+ * alerts (64 / 16) — enough for the next couple of sweeps. The store's addCar
+ * refuses beyond this.
+ */
+export const MAX_CARS = 16;
+
+/**
+ * Per-car notification budget for `carCount` cars: an even share of the iOS
+ * limit, at most MAX_PER_CAR, and at least 1 (so every car keeps its soonest
+ * alert; with MAX_CARS enforced the share never drops below 4).
+ */
+export function perCarCap(carCount: number): number {
+  return Math.max(1, Math.min(MAX_PER_CAR, Math.floor(IOS_PENDING_LIMIT / Math.max(1, carCount))));
+}
+
+export interface PlannedNotification {
+  reminder: Reminder;
+  /** The cleaning this notification warns about. */
+  cleaning: Date;
+  fireAt: Date;
+}
+
+/**
+ * Pure notification plan for a car: which (reminder, cleaning, fireAt) triples
+ * to schedule. Covers the next CLEANINGS_AHEAD cleanings, skips disabled
+ * reminders and fire times at/before `now`, dedupes identical fireAt per
+ * reminder, and keeps the soonest `maxPerCar`. Sorted soonest first.
+ */
+export function planCarNotifications(
+  car: Pick<Car, 'schedule' | 'reminders'>,
+  now: Date = new Date(),
+  cleaningsAhead: number = CLEANINGS_AHEAD,
+  maxPerCar: number = MAX_PER_CAR,
+): PlannedNotification[] {
+  const schedule = car.schedule;
+  if (!schedule) return [];
+  const plan: PlannedNotification[] = [];
+  for (const cleaning of getUpcomingCleanings(schedule, now, cleaningsAhead)) {
+    for (const f of computeFireTimes(schedule, cleaning, car.reminders, now)) {
+      // A same-day clock override at/after the sweep start (e.g. "day of at
+      // 9am" for an 8am sweep, possible after a re-park to a block with an
+      // earlier window) would warn after the fact: skip it.
+      if (f.fireAt.getTime() > cleaning.getTime()) continue;
+      if (!f.past) plan.push({ reminder: f.reminder, cleaning, fireAt: f.fireAt });
+    }
+  }
+  return finalizePlan(plan, maxPerCar);
+}
+
+/**
+ * Dedupe identical (reminder, fireAt) pairs (keeping the first), sort soonest
+ * first, and keep the soonest `max`. Exported for tests.
+ */
+export function finalizePlan(plan: PlannedNotification[], max: number): PlannedNotification[] {
+  const seen = new Set<string>();
+  const out = plan.filter((p) => {
+    const key = `${p.reminder.id}@${p.fireAt.getTime()}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  out.sort((a, b) => a.fireAt.getTime() - b.fireAt.getTime());
+  return out.slice(0, max);
 }

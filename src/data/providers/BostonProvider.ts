@@ -1,12 +1,13 @@
 import { CleaningSchedule } from '../../types';
 import { getNextCleaning } from '../../services/scheduling';
 import { reverseGeocodeParts } from '../../services/location';
+import { log } from '../../services/log';
 import { isWithinBoston } from '../coverage';
-import { nearestBlock, toSchedule, SNAPSHOT_BLOCKS } from '../snapshot';
+import { snapshotFallback, SNAPSHOT_BLOCKS } from '../snapshot';
 import { fetchRowsForStreet, pickRow, PickOptions, rowToSchedule } from './bostonApi';
 import { nearestSegment } from './samSegments';
 import { neighborhoodAt } from './bostonNeighborhoods';
-import { StreetCleaningProvider } from './types';
+import { LookupFailedError, StreetCleaningProvider } from './types';
 
 /**
  * Boston reference provider.
@@ -16,24 +17,48 @@ import { StreetCleaningProvider } from './types';
  * correct street *and side*, then looks that up in the name-keyed street-
  * sweeping open dataset (bostonApi.ts). If SAM is unreachable it falls back to
  * Apple reverse-geocoding for the street name; if the whole network is down it
- * falls back to the bundled offline snapshot.
+ * falls back to the bundled offline snapshot — but only for a point right on a
+ * snapshot block (SNAPSHOT_MAX_KM). Otherwise it throws LookupFailedError and
+ * the store keeps the car's cached schedule.
  *
- * Returns null when the point is outside Boston coverage, or when the resolved
- * street simply has no sweeping schedule — never fabricated data.
+ * Returns null (authoritative) only when the point is outside Boston coverage,
+ * or when the street SAM resolved simply has no sweeping schedule — never
+ * fabricated data. A street name from the geocoder fallback is only a guess
+ * (unnormalized, or a neighbouring street), so a miss on it is not a "no".
  */
+/** Result of BostonProvider.lookup: the schedule plus why a null is null. */
+export interface BostonLookup {
+  schedule: CleaningSchedule | null;
+  /**
+   * The point is inside a known Boston neighborhood (BPDA polygons resolved).
+   * Lets the router trust a "no row for this street" null even when it could
+   * not geocode the city itself.
+   */
+  inBoston: boolean;
+}
+
 export class BostonProvider implements StreetCleaningProvider {
   readonly id = 'boston';
   readonly name = 'Boston (SAM geometry + Analyze Boston open data)';
 
   async getScheduleForLocation(lat: number, lng: number): Promise<CleaningSchedule | null> {
+    return (await this.lookup(lat, lng)).schedule;
+  }
+
+  /** getScheduleForLocation plus whether the point is confirmed inside Boston. */
+  async lookup(lat: number, lng: number): Promise<BostonLookup> {
     // Out of coverage: no Boston data applies.
-    if (!isWithinBoston(lat, lng)) return null;
+    if (!isWithinBoston(lat, lng)) return { schedule: null, inBoston: false };
 
     // No in-memory cache: the store owns caching (car.schedule) and can force a
     // fresh lookup; caching here only risks serving stale results after a fix.
 
     let street: string | undefined;
     let opts: PickOptions = {};
+    // True when `street` came from SAM geometry (trustworthy), false when it
+    // came from the reverse-geocode fallback.
+    let streetFromSam = false;
+    let inBoston = false;
 
     // 1) Geometry-first: nearest real road segment via SAM (accurate street+side),
     //    plus the enclosing neighborhood (point-in-polygon) to disambiguate
@@ -51,11 +76,13 @@ export class BostonProvider implements StreetCleaningProvider {
       // not apply — bail so a same-named street elsewhere can't match a Boston
       // row and show a bogus schedule.
       if (hoodRes.ok && !hoodRes.name) {
-        console.log('[sweepalert:provider] point outside Boston — no coverage');
-        return null;
+        log.debug('[sweepalert:provider] point outside Boston — no coverage');
+        return { schedule: null, inBoston: false };
       }
+      inBoston = !!hoodRes.name;
       if (seg) {
         street = seg.street;
+        streetFromSam = true;
         opts = {
           // Prefer the precise BPDA neighborhood over SAM's coarse municipality.
           neighborhood: hoodRes.name ?? seg.neighborhood,
@@ -64,7 +91,7 @@ export class BostonProvider implements StreetCleaningProvider {
         };
       }
     } catch (err) {
-      console.warn('[BostonProvider] SAM lookup failed:', err);
+      log.warn('[BostonProvider] SAM lookup failed:', err);
     }
 
     // 2) Fallback: Apple reverse-geocode for a street name.
@@ -74,11 +101,12 @@ export class BostonProvider implements StreetCleaningProvider {
         street = parts.street;
         opts = { neighborhood: parts.neighborhood };
       } catch (err) {
-        console.warn('[BostonProvider] reverse-geocode failed:', err);
+        log.warn('[BostonProvider] reverse-geocode failed:', err);
       }
     }
 
-    console.log(
+    // Street names are location data: debug only.
+    log.debug(
       `[sweepalert:provider] resolved street="${street ?? 'none'}" side=${opts.side ?? '?'} ` +
         `nb=${opts.neighborhood ?? '?'} cross=[${(opts.crossStreets ?? []).slice(0, 5).join(', ')}]`,
     );
@@ -87,20 +115,26 @@ export class BostonProvider implements StreetCleaningProvider {
       try {
         const rows = await fetchRowsForStreet(street);
         const row = pickRow(rows, opts);
-        console.log(
+        log.debug(
           `[sweepalert:provider] ${rows.length} rows; picked ${row?.dist_name ?? '-'}/${row?.side ?? '-'}/` +
             `${row?.from ?? '-'}->${row?.to ?? '-'} => ${row ? rowToSchedule(row).scheduleLabel : 'none'}`,
         );
-        return row ? rowToSchedule(row) : null;
+        if (row) return { schedule: rowToSchedule(row), inBoston };
+        // No row for a SAM-resolved street: authoritative "no schedule here".
+        // For a geocoder-guessed street it may just be the wrong name: snapshot,
+        // else unknown (keeps the car's cached schedule).
+        if (streetFromSam) return { schedule: null, inBoston };
+        return { schedule: this.fallback(lat, lng), inBoston };
       } catch (err) {
-        // Network error querying the dataset -> offline snapshot.
-        console.warn('[BostonProvider] sweeping query failed, using snapshot:', err);
-        return this.fallback(lat, lng);
+        // Network error querying the dataset -> offline snapshot, else unknown.
+        log.warn('[BostonProvider] sweeping query failed, trying snapshot:', err);
+        return { schedule: this.fallback(lat, lng, err), inBoston };
       }
     }
 
-    // Couldn't resolve a street at all (likely fully offline) -> snapshot.
-    return this.fallback(lat, lng);
+    // Couldn't resolve a street at all (SAM + geocode both failed, likely fully
+    // offline) -> snapshot, else unknown.
+    return { schedule: this.fallback(lat, lng), inBoston };
   }
 
   /**
@@ -116,8 +150,16 @@ export class BostonProvider implements StreetCleaningProvider {
     return getNextCleaning(schedule, from);
   }
 
-  private fallback(lat: number, lng: number): CleaningSchedule {
-    return toSchedule(nearestBlock(lat, lng));
+  /**
+   * Distance-gated snapshot lookup for when the live lookup could not answer.
+   * A snapshot block within SNAPSHOT_MAX_KM is a valid answer; with none nearby
+   * we genuinely don't know, so throw (never return null here — null would tell
+   * the store "no schedule" and wipe the car's cached one).
+   */
+  private fallback(lat: number, lng: number, cause?: unknown): CleaningSchedule {
+    const snap = snapshotFallback(lat, lng);
+    if (snap) return snap;
+    throw new LookupFailedError('Boston lookup failed and no offline snapshot block is nearby', cause);
   }
 }
 

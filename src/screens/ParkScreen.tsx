@@ -1,10 +1,9 @@
 import { BottomTabScreenProps } from '@react-navigation/bottom-tabs';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, View } from 'react-native';
-import MapView, { Circle, Marker, Region } from 'react-native-maps';
+import { Alert, View } from 'react-native';
+import MapView, { LatLng } from 'react-native-maps';
 
-import { Button } from '../components/Button';
-import { Mono, MonoLabel, T } from '../components/primitives';
+import { T } from '../components/primitives';
 import { Screen } from '../components/Screen';
 import { RootTabParamList } from '../navigation/types';
 import { getProvider } from '../data/providers';
@@ -15,23 +14,31 @@ import {
   requestPermission,
   reverseGeocodeParts,
 } from '../services/location';
+import { log } from '../services/log';
 import * as nfc from '../services/nfc';
 import { useStore } from '../state/store';
 import { useTheme } from '../theme/ThemeContext';
 import { CleaningSchedule, ParkingSpot } from '../types';
+import { CaptureControls, CaptureMode } from './park/CaptureControls';
+import { CarAssignPicker } from './park/CarAssignPicker';
+import { DetectedBlockCard } from './park/DetectedBlockCard';
+import { BOSTON, ParkMap } from './park/ParkMap';
+import { SaveSpotAction } from './park/SaveSpotAction';
+import { StreetPicker } from './park/StreetPicker';
 
 type Props = BottomTabScreenProps<RootTabParamList, 'Park'>;
 
-const BOSTON: Region = { latitude: 42.3554, longitude: -71.0708, latitudeDelta: 0.04, longitudeDelta: 0.04 };
+// ParkScreen owns all state and side effects (geocoding, GPS / NFC capture,
+// saving); the pieces under ./park are presentational and take explicit props.
 
 export function ParkScreen({ route, navigation }: Props) {
-  const { c, isDark } = useTheme();
+  const { c } = useTheme();
   const cars = useStore((s) => s.cars);
   const parkCar = useStore((s) => s.parkCar);
 
   const initialCarId = route.params?.carId ?? cars[0]?.id;
   const [assignId, setAssignId] = useState<string | undefined>(initialCarId);
-  const [capture, setCapture] = useState<'gps' | 'nfc'>('gps');
+  const [capture, setCapture] = useState<CaptureMode>('gps');
   const [coord, setCoord] = useState({ latitude: BOSTON.latitude, longitude: BOSTON.longitude });
   const [address, setAddress] = useState<string>('');
   const [schedule, setSchedule] = useState<CleaningSchedule | null>(null);
@@ -69,7 +76,15 @@ export function ParkScreen({ route, navigation }: Props) {
       const isBoston = city.includes('boston');
       const isCambridge = city.includes('cambridge');
       const [s, seg] = await Promise.all([
-        getProvider().getScheduleForLocation(lat, lng),
+        // The provider throws (LookupFailedError) when it can't answer — offline,
+        // service error. For this preview that reads as "no data" rather than
+        // leaving the card stuck on "Locating…".
+        getProvider()
+          .getScheduleForLocation(lat, lng)
+          .catch((err) => {
+            log.warn('[ParkScreen] schedule lookup failed:', err);
+            return null;
+          }),
         // The street-name selector is Boston-only (SAM). Skip it elsewhere so
         // Cambridge doesn't show Boston streets from across the river.
         isBoston ? nearestSegment(lat, lng).catch(() => null) : Promise.resolve(null),
@@ -102,12 +117,15 @@ export function ParkScreen({ route, navigation }: Props) {
         : null;
       setSchedule(s);
       setSaved(false);
+    } catch (err) {
+      // Lookup failed (offline / service error): keep the current schedule.
+      log.warn('[ParkScreen] street lookup failed:', err);
     } finally {
       setBusy(false);
     }
   };
 
-  const useGps = async ({ silent = false }: { silent?: boolean } = {}) => {
+  const locateWithGps = async ({ silent = false }: { silent?: boolean } = {}) => {
     setBusy(true);
     setCapture('gps');
     try {
@@ -150,7 +168,7 @@ export function ParkScreen({ route, navigation }: Props) {
       setPermDenied(true);
       return;
     }
-    await useGps({ silent: true });
+    await locateWithGps({ silent: true });
   };
 
   // On first mount: if re-parking a car that already has a saved spot, center on
@@ -197,14 +215,14 @@ export function ParkScreen({ route, navigation }: Props) {
         'This device or build has no NFC reader (Expo Go and simulators do not). Falling back to GPS. See the README to run a dev build on an NFC phone.',
       );
       setCapture('gps');
-      await useGps();
+      await locateWithGps();
       return;
     }
     Alert.alert('Tap your SweepAlert tag', 'Hold your phone to the tag on your dash…');
     const tag = await nfc.readTag();
     if (tag) {
       // A real tag tap triggers a GPS capture (the tag identifies the car/action).
-      await useGps();
+      await locateWithGps();
     }
   };
 
@@ -245,6 +263,14 @@ export function ParkScreen({ route, navigation }: Props) {
     return reals.slice(0, 4);
   }, [streetCandidates, schedule?.address]);
 
+  // Hand-placed pin (map tap or drag): re-geocode, and GPS accuracy no longer applies.
+  const placePin = (next: LatLng) => {
+    setCoord(next);
+    setAddress('');
+    setAccuracyM(null);
+    setSaved(false);
+  };
+
   const activeReminders = cars.find((x) => x.id === assignId)?.reminders.filter((r) => r.enabled).length ?? 0;
 
   return (
@@ -260,209 +286,28 @@ export function ParkScreen({ route, navigation }: Props) {
         </T>
       </View>
 
-      {permDenied && (
-        <Pressable
-          onPress={() => useGps()}
-          style={{ padding: 12, borderRadius: 14, backgroundColor: c.warnT, borderWidth: 1, borderColor: c.warn }}
-        >
-          <T style={{ fontSize: 12.5, fontWeight: '600', color: c.warn }}>
-            Location is off — drop the pin manually, or tap to try GPS again.
-          </T>
-        </Pressable>
-      )}
+      <CaptureControls
+        capture={capture}
+        located={located}
+        accuracyM={accuracyM}
+        permDenied={permDenied}
+        onUseGps={() => locateWithGps()}
+        onUseNfc={useNfc}
+      />
 
-      <View style={{ flexDirection: 'row', gap: 9 }}>
-        <CaptureBtn
-          active={capture === 'gps'}
-          title={located ? 'Re-center on me' : 'Use my location'}
-          sub={accuracyM != null ? `accurate to ±${Math.round(accuracyM)}m` : 'phone GPS'}
-          onPress={() => useGps()}
-        />
-        <CaptureBtn
-          active={capture === 'nfc'}
-          title="Tap NFC tag in car"
-          sub="hands-free, no app"
-          onPress={useNfc}
-        />
-      </View>
+      <ParkMap mapRef={mapRef} coord={coord} accuracyM={accuracyM} busy={busy} onPlacePin={placePin} />
 
-      <View style={{ height: 290, borderRadius: 26, overflow: 'hidden', borderWidth: 1, borderColor: c.line }}>
-        <MapView
-          ref={mapRef}
-          style={{ flex: 1 }}
-          initialRegion={BOSTON}
-          userInterfaceStyle={isDark ? 'dark' : 'light'}
-          onPress={(e) => {
-            setCoord(e.nativeEvent.coordinate);
-            setAddress('');
-            setAccuracyM(null); // hand-placed: GPS accuracy no longer applies
-            setSaved(false);
-          }}
-        >
-          {/* GPS accuracy radius — shows how precise the fix is. */}
-          {accuracyM != null && accuracyM > 0 && (
-            <Circle
-              center={coord}
-              radius={accuracyM}
-              strokeColor={c.accent}
-              fillColor={`${c.accent}22`}
-              strokeWidth={1}
-            />
-          )}
-          <Marker
-            coordinate={coord}
-            draggable
-            onDragEnd={(e) => {
-              setCoord(e.nativeEvent.coordinate);
-              setAddress('');
-              setAccuracyM(null);
-              setSaved(false);
-            }}
-            pinColor={c.accent}
-          />
-        </MapView>
-        {busy && (
-          <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: 'rgba(0,0,0,0.06)' }}>
-            <ActivityIndicator color={c.accent} />
-            <Mono style={{ fontSize: 11, color: c.dim }}>
-              {accuracyM != null ? `refining… ±${Math.round(accuracyM)}m` : 'finding your location…'}
-            </Mono>
-          </View>
-        )}
-      </View>
+      <DetectedBlockCard unsupported={unsupported} detected={detected} schedule={schedule} geocoding={geocoding}>
+        <CarAssignPicker cars={cars} assignId={assignId} onAssign={setAssignId} />
+      </DetectedBlockCard>
 
-      {/* Detected block, or an out-of-coverage notice */}
-      <View style={{ padding: 18, borderRadius: 24, backgroundColor: c.card, borderWidth: 1, borderColor: c.line, gap: 14 }}>
-        {unsupported ? (
-          <>
-            <View style={{ gap: 5 }}>
-              <MonoLabel>OUTSIDE COVERAGE</MonoLabel>
-              <T style={{ fontSize: 18, fontWeight: '700', letterSpacing: -0.3 }}>Not supported here yet</T>
-              <T style={{ fontSize: 13, fontWeight: '500', color: c.dim }}>
-                {detected.addr}
-              </T>
-            </View>
-            <View style={{ padding: 14, borderRadius: 16, backgroundColor: c.warnT, gap: 6 }}>
-              <T style={{ fontSize: 14, fontWeight: '700', color: c.warn }}>
-                SweepAlert covers Boston and Cambridge. This spot is outside both.
-              </T>
-              <Mono style={{ fontSize: 11.5, color: c.dim }}>
-                You can still save where you parked, but there are no cleaning reminders for this area.
-              </Mono>
-            </View>
-          </>
-        ) : (
-          <>
-            <View style={{ gap: 5 }}>
-              <MonoLabel>DETECTED BLOCK</MonoLabel>
-              <T style={{ fontSize: 18, fontWeight: '700', letterSpacing: -0.3 }}>{detected.addr}</T>
-              {!!detected.block && (
-                <T style={{ fontSize: 13, fontWeight: '500', color: c.dim }}>{detected.block}</T>
-              )}
-            </View>
-            {schedule ? (
-              <View style={{ padding: 14, borderRadius: 16, backgroundColor: c.accentT, gap: 6 }}>
-                <T style={{ fontSize: 14, fontWeight: '700', color: c.accent }}>{detected.sched}</T>
-                <Mono style={{ fontSize: 11.5, color: c.dim }}>{detected.season}</Mono>
-              </View>
-            ) : (
-              <View style={{ padding: 14, borderRadius: 16, backgroundColor: c.card2, gap: 6 }}>
-                <T style={{ fontSize: 13, fontWeight: '600', color: c.dim }}>
-                  {geocoding ? 'Looking up the cleaning schedule…' : 'No street-cleaning data for this location.'}
-                </T>
-                {!geocoding && (
-                  <Mono style={{ fontSize: 11, color: c.dim }}>
-                    SweepAlert covers Boston and Cambridge. If you’re in Boston, try picking the street below.
-                  </Mono>
-                )}
-              </View>
-            )}
-          </>
-        )}
-        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-          <T style={{ fontSize: 13, fontWeight: '500', color: c.dim }}>Assign to</T>
-          <View style={{ flexDirection: 'row', gap: 7, flexWrap: 'wrap', flexShrink: 1, justifyContent: 'flex-end' }}>
-            {cars.map((car) => {
-              const on = assignId === car.id;
-              return (
-                <Pressable
-                  key={car.id}
-                  onPress={() => setAssignId(car.id)}
-                  style={{
-                    paddingVertical: 9,
-                    paddingHorizontal: 12,
-                    borderRadius: 999,
-                    borderWidth: 1,
-                    borderColor: on ? c.accent : c.line,
-                    backgroundColor: on ? c.accent : c.card,
-                  }}
-                >
-                  <T style={{ fontSize: 12, fontWeight: '600', color: on ? '#fff' : c.dim }}>{car.name}</T>
-                </Pressable>
-              );
-            })}
-          </View>
-        </View>
-      </View>
-
-      {/* Street selector — GPS in a back alley can't tell which flanking street
-          you parked on (Boylston vs Newbury), so make it an obvious one-tap
-          choice rather than a silent guess. Real streets only, nearest first. */}
+      {/* Street selector — real streets only, nearest first; only worth
+          showing when there's an actual choice to make. */}
       {!unsupported && realStreetCandidates.length > 1 && (
-        <View style={{ gap: 8, marginTop: -6 }}>
-          <MonoLabel>WHICH STREET DID YOU PARK ON?</MonoLabel>
-          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
-            {realStreetCandidates.map((st) => {
-              const on = schedule?.address === st;
-              return (
-                <Pressable
-                  key={st}
-                  onPress={() => chooseStreet(st)}
-                  style={{
-                    paddingVertical: 8,
-                    paddingHorizontal: 12,
-                    borderRadius: 999,
-                    borderWidth: 1,
-                    borderColor: on ? c.accent : c.line,
-                    backgroundColor: on ? c.accentT : c.card2,
-                  }}
-                >
-                  <T style={{ fontSize: 12, fontWeight: '600', color: on ? c.accent : c.ink }}>{st}</T>
-                </Pressable>
-              );
-            })}
-          </View>
-        </View>
+        <StreetPicker streets={realStreetCandidates} selected={schedule?.address} onChoose={chooseStreet} />
       )}
 
-      <Button title={unsupported ? 'Save location anyway' : 'Save parking spot'} onPress={onSave} />
-      {saved && (
-        <T style={{ textAlign: 'center', fontSize: 12.5, fontWeight: '500', color: unsupported ? c.warn : c.ok }}>
-          {unsupported
-            ? 'Location saved. No cleaning schedule for this area — no reminders set.'
-            : `Saved. ${activeReminders} reminders set for this block.`}
-        </T>
-      )}
+      <SaveSpotAction unsupported={unsupported} saved={saved} activeReminders={activeReminders} onSave={onSave} />
     </Screen>
-  );
-}
-
-function CaptureBtn({ active, title, sub, onPress }: { active: boolean; title: string; sub: string; onPress: () => void }) {
-  const { c } = useTheme();
-  return (
-    <Pressable
-      onPress={onPress}
-      style={{
-        flex: 1,
-        padding: 13,
-        borderRadius: 16,
-        borderWidth: 1,
-        borderColor: active ? c.accent : c.line,
-        backgroundColor: active ? c.accent : c.card,
-      }}
-    >
-      <T style={{ fontSize: 13, fontWeight: '600', color: active ? '#fff' : c.dim }}>{title}</T>
-      <Mono style={{ fontSize: 11, marginTop: 2, color: active ? 'rgba(255,255,255,0.75)' : c.dim }}>{sub}</Mono>
-    </Pressable>
   );
 }

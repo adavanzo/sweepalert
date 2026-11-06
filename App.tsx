@@ -5,7 +5,7 @@ import { View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { RootNavigator } from './src/navigation/RootNavigator';
-import { useStore } from './src/state/store';
+import { startAppLifecycle } from './src/state/lifecycle';
 import { ThemeProvider, useTheme } from './src/theme/ThemeContext';
 
 function navTheme(isDark: boolean, bg: string, card: string, ink: string, accent: string): Theme {
@@ -18,12 +18,10 @@ function navTheme(isDark: boolean, bg: string, card: string, ink: string, accent
 
 function Inner() {
   const { c, isDark } = useTheme();
-  const init = useStore((s) => s.init);
-
-  // Kick the engine on cold start (also re-run by the persist rehydrate hook).
-  useEffect(() => {
-    init();
-  }, [init]);
+  // The engine (store.init) is kicked by the persist rehydrate hook in
+  // state/store.ts, after AsyncStorage hydration — not here, which could race it.
+  // Foreground refresh / hydration retry (one listener, removed on unmount).
+  useEffect(() => startAppLifecycle(), []);
 
   return (
     <View style={{ flex: 1, backgroundColor: c.bg }}>

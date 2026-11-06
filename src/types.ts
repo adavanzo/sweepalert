@@ -17,7 +17,11 @@ export type StreetSide =
   | 'west'
   | 'both';
 
-/** Notification delivery channel. `alarm` maps to a Critical/time-sensitive alert. */
+/**
+ * Notification delivery channel. `alarm` is shown as "Urgent": iOS time-sensitive
+ * (when entitled) + Android high-priority channel; see services/notificationChannels.ts.
+ * The stored value stays 'alarm' so saved reminders keep working without a migration.
+ */
 export type Channel = 'push' | 'alarm';
 
 /** A single recurrence rule: a weekday plus which weeks of the month it fires. */
