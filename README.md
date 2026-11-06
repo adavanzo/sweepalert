@@ -98,6 +98,8 @@ runs in the schedule's IANA timezone so it is DST-correct.
 ```ts
 getNextCleaning(schedule, from): Date | null   // next sweep after `from`
 computeFireTimes(schedule, cleaning, reminders, now): FireTime[]  // notif times
+getUpcomingCleanings(schedule, from, count): Date[]  // next N sweeps
+planCarNotifications(car, now): PlannedNotification[]  // what to schedule
 ```
 
 - **Recurrence** — a `CleaningRule` is `{ weekday, weeksOfMonth }`. Empty
@@ -106,8 +108,13 @@ computeFireTimes(schedule, cleaning, reminders, now): FireTime[]  // notif times
   days are skipped and the engine rolls forward to next April.
 - **DST** — a sweep at "08:00 local" stays 08:00 across the spring-forward and
   fall-back boundaries; "night before at 8pm" reminders likewise (see tests).
-- **Roll-forward** — reminders reschedule automatically after each event passes
-  and whenever a car is moved (`store.refreshCar` → `notifications.syncCarNotifications`).
+- **Roll-forward** — each car's reminders are pre-scheduled for the next 3
+  cleanings (`planCarNotifications`, capped at 16 per car — and fewer with 5+
+  cars, `perCarCap` — so the total stays under iOS's 64-pending limit; past 64
+  cars only each car's soonest alert is kept), so alerts keep firing even if the
+  app isn't reopened; the
+  window rolls forward on every launch and whenever a car is moved
+  (`store.refreshCar` → `notifications.syncCarNotifications`).
 
 Run `npm test` to see the DST / season / fire-time cases.
 
@@ -126,9 +133,11 @@ interface StreetCleaningProvider {
 
 - **`BostonProvider`** (reference) is wired to the **live public dataset** on
   [Analyze Boston](https://data.boston.gov/dataset/street-sweeping-schedules)
-  (`data.boston.gov`), served via CKAN's datastore API — **no API key**. It
-  **falls back to the bundled snapshot** when the network is unreachable or a
-  street isn't in the dataset, so the app is always demoable offline.
+  (`data.boston.gov`), served via CKAN's datastore API — **no API key**. When
+  the network is unreachable it **falls back to the bundled snapshot** only for a
+  point within ~100 m of a snapshot block (the demo cars); otherwise it returns
+  no schedule and the car keeps its last cached schedule rather than showing
+  made-up data.
 - **`ReCollectProvider`** covers cities whose schedule lives in **ReCollect**
   (recollect.net) rather than open data — currently **Cambridge**. Cambridge
   sweeps monthly (Apr–Dec), odd/even sides on different days, and ReCollect
@@ -227,8 +236,10 @@ CleaningSchedule { blockId, rules, windowStart, windowEnd, side, season, timezon
 Reminder       { id, carId, label, offsetMinutes, timeOfDayOverride?, channel, enabled, notificationId? }
 ```
 
-Zustand persists only the durable domain data; schedules, next-cleaning times,
-and OS notification IDs are recomputed on launch by `store.init()`.
+Zustand persists only the durable domain data (plus a `seeded` flag so demo
+cars are seeded only once); schedules, next-cleaning times, and OS notification
+IDs are refreshed on launch by `store.init()`, keeping the cached schedule if the
+lookup fails offline.
 
 ---
 

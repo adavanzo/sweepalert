@@ -2,7 +2,7 @@ import { CleaningSchedule } from '../../types';
 import { getNextCleaning } from '../../services/scheduling';
 import { reverseGeocodeParts } from '../../services/location';
 import { isWithinBoston } from '../coverage';
-import { nearestBlock, toSchedule, SNAPSHOT_BLOCKS } from '../snapshot';
+import { snapshotFallback, SNAPSHOT_BLOCKS } from '../snapshot';
 import { fetchRowsForStreet, pickRow, PickOptions, rowToSchedule } from './bostonApi';
 import { nearestSegment } from './samSegments';
 import { neighborhoodAt } from './bostonNeighborhoods';
@@ -16,7 +16,9 @@ import { StreetCleaningProvider } from './types';
  * correct street *and side*, then looks that up in the name-keyed street-
  * sweeping open dataset (bostonApi.ts). If SAM is unreachable it falls back to
  * Apple reverse-geocoding for the street name; if the whole network is down it
- * falls back to the bundled offline snapshot.
+ * falls back to the bundled offline snapshot — but only for a point right on a
+ * snapshot block (SNAPSHOT_MAX_KM). Otherwise it returns null and the store
+ * keeps the car's cached schedule.
  *
  * Returns null when the point is outside Boston coverage, or when the resolved
  * street simply has no sweeping schedule — never fabricated data.
@@ -116,8 +118,9 @@ export class BostonProvider implements StreetCleaningProvider {
     return getNextCleaning(schedule, from);
   }
 
-  private fallback(lat: number, lng: number): CleaningSchedule {
-    return toSchedule(nearestBlock(lat, lng));
+  /** Distance-gated snapshot lookup; null when no snapshot block is nearby. */
+  private fallback(lat: number, lng: number): CleaningSchedule | null {
+    return snapshotFallback(lat, lng);
   }
 }
 

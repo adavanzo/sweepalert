@@ -3,7 +3,9 @@
  *
  * Responsibilities:
  *  - request/report permission (with denied-state fallback for the UI)
- *  - schedule one OS notification per (enabled, future) reminder fire time
+ *  - schedule one OS notification per (enabled, future) reminder fire time for
+ *    each of the next few cleanings (planCarNotifications in scheduling.ts), so
+ *    alerts keep coming even if the app isn't reopened between sweeps
  *  - cancel a car's notifications and reschedule when the next cleaning advances
  *    or the car is moved.
  *
@@ -11,10 +13,12 @@
  * schedule, location, or reminders change.
  */
 import * as Notifications from 'expo-notifications';
+import { DateTime } from 'luxon';
 import { Platform } from 'react-native';
 
 import { Car } from '../types';
-import { computeFireTimes } from './scheduling';
+import { MAX_PER_CAR, planCarNotifications } from './scheduling';
+import { keyedSerial } from './serial';
 
 // Foreground presentation: show the banner even when the app is open.
 Notifications.setNotificationHandler({
@@ -47,8 +51,17 @@ export async function requestPermission(): Promise<PermissionState> {
   return status as PermissionState;
 }
 
+// Cancel/sync calls for the same car run one at a time, so two concurrent
+// syncs (e.g. launch refresh + a reminder toggle) can't both cancel and then
+// both schedule, leaving duplicate sets behind.
+const perCar = keyedSerial();
+
 /** Cancel every scheduled notification whose data.carId matches. */
-export async function cancelCarNotifications(carId: string): Promise<void> {
+export function cancelCarNotifications(carId: string): Promise<void> {
+  return perCar(carId, () => cancelNow(carId));
+}
+
+async function cancelNow(carId: string): Promise<void> {
   const scheduled = await Notifications.getAllScheduledNotificationsAsync();
   await Promise.all(
     scheduled
@@ -58,38 +71,46 @@ export async function cancelCarNotifications(carId: string): Promise<void> {
 }
 
 /**
- * Reconcile a car's OS notifications with its current reminders + next cleaning.
- * Cancels the car's existing notifications and re-schedules the future ones.
- * Returns the reminder->notificationId map so the store can persist it.
+ * Reconcile a car's OS notifications with its current reminders + schedule.
+ * Cancels the car's existing notifications and re-schedules the planned ones
+ * (next CLEANINGS_AHEAD cleanings, capped at `maxPerCar` — the store passes
+ * perCarCap(cars) so all cars together stay under iOS's 64; see scheduling.ts).
+ * Serialized per car with cancelCarNotifications.
+ * Returns reminderId -> id of that reminder's soonest notification so the store
+ * can persist it.
  */
-export async function syncCarNotifications(car: Car): Promise<Record<string, string>> {
-  await cancelCarNotifications(car.id);
+export function syncCarNotifications(car: Car, maxPerCar: number = MAX_PER_CAR): Promise<Record<string, string>> {
+  return perCar(car.id, () => syncNow(car, maxPerCar));
+}
+
+async function syncNow(car: Car, maxPerCar: number): Promise<Record<string, string>> {
+  await cancelNow(car.id);
   const ids: Record<string, string> = {};
 
-  if (!car.schedule || car.nextCleaning == null) return ids;
+  const schedule = car.schedule;
+  if (!schedule) return ids;
   const perm = await getPermissionState();
   if (perm !== 'granted') return ids;
 
-  const cleaning = new Date(car.nextCleaning);
-  const fires = computeFireTimes(car.schedule, cleaning, car.reminders).filter((f) => !f.past);
-
-  for (const f of fires) {
-    const critical = f.reminder.channel === 'alarm';
+  // Plan is sorted soonest first, so the first id per reminder is its soonest.
+  for (const p of planCarNotifications(car, new Date(), undefined, maxPerCar)) {
+    const critical = p.reminder.channel === 'alarm';
+    const when = DateTime.fromJSDate(p.cleaning, { zone: schedule.timezone }).toFormat('ccc LLL d, h:mm a');
     const id = await Notifications.scheduleNotificationAsync({
       content: {
         title: critical ? `🚨 Move ${car.name}` : `🚗 Move ${car.name}`,
-        body: `${car.schedule.scheduleLabel}. ${car.location?.address ?? car.schedule.address} — ${f.reminder.label}.`,
-        data: { carId: car.id, reminderId: f.reminder.id },
+        body: `Sweeping ${when}. ${car.location?.address ?? schedule.address} — ${p.reminder.label}.`,
+        data: { carId: car.id, reminderId: p.reminder.id, cleaning: p.cleaning.getTime() },
         sound: 'default',
         ...(critical ? { priority: Notifications.AndroidNotificationPriority.MAX } : {}),
       },
       trigger: {
         type: Notifications.SchedulableTriggerInputTypes.DATE,
-        date: f.fireAt,
+        date: p.fireAt,
         channelId: Platform.OS === 'android' ? 'sweep' : undefined,
       },
     });
-    ids[f.reminder.id] = id;
+    if (!ids[p.reminder.id]) ids[p.reminder.id] = id;
   }
   return ids;
 }
