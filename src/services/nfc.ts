@@ -18,7 +18,7 @@ let mod: NfcManagerModule | null | undefined; // undefined = not yet probed
 function load(): NfcManagerModule | null {
   if (mod !== undefined) return mod;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     mod = require('react-native-nfc-manager') as NfcManagerModule;
   } catch {
     mod = null;

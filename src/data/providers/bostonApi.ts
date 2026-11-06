@@ -19,6 +19,8 @@
 import Constants from 'expo-constants';
 
 import { CleaningSchedule } from '../../types';
+import { fetchWithTimeout } from '../../services/http';
+import { log } from '../../services/log';
 import { toSchedule, SNAPSHOT_BLOCKS } from '../snapshot';
 import { normalizeStreet, rowToSchedule, SweepRow } from './bostonMapping';
 
@@ -45,7 +47,7 @@ function resourceId(): string {
  */
 export async function fetchRowsForStreet(street: string): Promise<SweepRow[]> {
   const url = `${ckanBase()}/datastore_search?resource_id=${resourceId()}&limit=50&q=${encodeURIComponent(street)}`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   if (!res.ok) throw new Error(`CKAN HTTP ${res.status}`);
   const json = (await res.json()) as { success: boolean; result?: { records?: SweepRow[] } };
   if (!json.success || !json.result?.records) throw new Error('CKAN response not successful');
@@ -78,13 +80,13 @@ export async function searchSchedules(term: string, limit = 150): Promise<Cleani
     const sql =
       `SELECT ${SEARCH_FIELDS} FROM "${resourceId()}" ` +
       `WHERE st_name ILIKE '%${safe}%' ORDER BY st_name, side LIMIT ${limit}`;
-    const res = await fetch(`${ckanBase()}/datastore_search_sql?sql=${encodeURIComponent(sql)}`);
+    const res = await fetchWithTimeout(`${ckanBase()}/datastore_search_sql?sql=${encodeURIComponent(sql)}`);
     if (!res.ok) throw new Error(`CKAN SQL HTTP ${res.status}`);
     const json = (await res.json()) as { success: boolean; result?: { records?: SweepRow[] } };
     if (!json.success || !json.result?.records) throw new Error('CKAN SQL not successful');
     return json.result.records.map(rowToSchedule);
   } catch (err) {
-    console.warn('[searchSchedules] live search failed, using snapshot:', err);
+    log.warn('[searchSchedules] live search failed, using snapshot:', err);
     const t = safe.toLowerCase();
     return SNAPSHOT_BLOCKS.filter((b) => b.address.toLowerCase().includes(t)).map(toSchedule);
   }

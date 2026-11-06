@@ -8,19 +8,21 @@
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { create } from 'zustand';
-import { createJSONStorage, persist } from 'zustand/middleware';
+import { createJSONStorage, persist, StateStorage } from 'zustand/middleware';
 
 import { Car, ParkingSpot, Reminder } from '../types';
 import { ThemeName as _ThemeName } from '../theme/tokens';
 import { getProvider } from '../data/providers';
+import { log } from '../services/log';
 import { syncCarNotifications, cancelCarNotifications } from '../services/notifications';
 import { seedCars, uid } from '../services/seed';
 import { ReminderPreset } from '../services/presets';
-import { perCarCap } from '../services/scheduling';
+import { MAX_CARS, perCarCap } from '../services/scheduling';
 import { migratePersisted, PERSIST_VERSION, shouldSeed } from './persistence';
 
 // Re-export for convenience.
 export type { ThemeName } from '../theme/tokens';
+export { MAX_CARS } from '../services/scheduling';
 
 interface StoreState {
   theme: _ThemeName;
@@ -30,6 +32,12 @@ interface StoreState {
   /** Persisted: demo cars were seeded once (or this install predates the flag). */
   seeded: boolean;
   cars: Car[];
+  /**
+   * Not persisted: reading saved state failed this session. Writes are blocked
+   * (so defaults never overwrite the user's real data) and hydration is retried
+   * when the app returns to the foreground.
+   */
+  loadError: boolean;
 
   // ---- lifecycle ----
   init: () => Promise<void>;
@@ -38,7 +46,11 @@ interface StoreState {
   toggleEmpty: () => void;
 
   // ---- car CRUD ----
-  addCar: (input: { name: string; color: string; plate?: string; location?: ParkingSpot }) => Promise<string>;
+  /**
+   * Returns the new car's id, or null when nothing was added: already at
+   * MAX_CARS, or saved state failed to load (loadError).
+   */
+  addCar: (input: { name: string; color: string; plate?: string; location?: ParkingSpot }) => Promise<string | null>;
   updateCar: (carId: string, patch: Partial<Pick<Car, 'name' | 'color' | 'plate'>>) => void;
   removeCar: (carId: string) => Promise<void>;
   /** Park/re-park a car: set location, resolve schedule, reschedule alerts. */
@@ -53,7 +65,10 @@ interface StoreState {
   // ---- engine glue ----
   /** Recompute schedule + nextCleaning for a car and resync notifications. */
   refreshCar: (carId: string, force?: boolean) => Promise<void>;
-  /** Recompute every car (called on init and when the day rolls over). */
+  /**
+   * Recompute every car: forced on init; non-forced (cached schedules, cheap)
+   * when the app returns to the foreground and when a car's nextCleaning passes.
+   */
   refreshAll: (force?: boolean) => Promise<void>;
 }
 
@@ -64,19 +79,21 @@ async function resolveSchedule(car: Car, force = false): Promise<Car> {
   }
   // `force` re-runs the live lookup even if a schedule is cached, so improved
   // resolution (neighborhood/cross-street matching) reaches already-parked cars.
-  // A null/failed lookup (e.g. offline) keeps the existing schedule rather than
-  // wiping it. parkCar clears the schedule first, so a new spot never inherits it.
-  let fetched = car.schedule;
+  // Provider contract (providers/types.ts): null is an authoritative "no
+  // schedule here" and clears the cached schedule; a throw (LookupFailedError,
+  // e.g. offline) means "unknown" and keeps it. parkCar clears the schedule
+  // first, so a new spot never inherits the old one.
+  let schedule = car.schedule;
   if (force || !car.schedule) {
     try {
-      fetched = (await provider.getScheduleForLocation(car.location.lat, car.location.lng)) ?? car.schedule;
+      schedule = (await provider.getScheduleForLocation(car.location.lat, car.location.lng)) ?? undefined;
     } catch (err) {
-      console.warn('[sweepalert] schedule lookup failed, keeping cached schedule:', err);
+      log.warn('[sweepalert] schedule lookup failed, keeping cached schedule:', err);
     }
   }
-  const schedule = fetched ?? undefined;
   const next = schedule ? provider.getNextCleaning(schedule, new Date()) : null;
-  console.log(
+  // Includes the parked address: debug only.
+  log.debug(
     `[sweepalert] ${car.name} @ ${car.location.address} -> ${schedule?.address ?? 'none'} · ` +
       `${schedule?.scheduleLabel ?? 'no schedule'} · next ${next ? next.toISOString() : 'n/a'}`,
   );
@@ -84,8 +101,87 @@ async function resolveSchedule(car: Car, force = false): Promise<Car> {
 }
 
 // In-flight/completed init, so init() runs once even if called again (e.g. a
-// second rehydrate) and never starts a concurrent refreshAll.
+// second rehydrate) and never starts a concurrent refreshAll. Reset to null if
+// init fails, so a later call (foreground / successful rehydrate) retries.
 let initPromise: Promise<void> | null = null;
+
+// In-flight refreshAll, so the foreground listener and wake timer coalesce
+// onto a running refresh instead of stacking concurrent ones.
+let refreshing: Promise<void> | null = null;
+// Car ids the in-flight refreshAll loop iterates (set when the loop starts;
+// null while it is still queued and will read the current list). A non-forced
+// call may only piggyback when this matches the current cars: otherwise (e.g.
+// addCar shrank perCarCap) cars the loop already synced keep a stale budget.
+let refreshingIds: string | null = null;
+
+const carIdsKey = (cars: Car[]) => cars.map((c) => c.id).join(',');
+
+/**
+ * Persistence write gate. Starts closed and opens only after a successful
+ * hydration: until then the store holds defaults, and persist writes the whole
+ * state on every set() — so a write before (or after a failed) hydration would
+ * replace the user's saved cars with an empty list. Closed again if hydration
+ * fails; reopened by a successful retry (see onRehydrateStorage).
+ */
+let persistBlocked = true;
+
+const guardedStorage: StateStorage = {
+  getItem: (name) => AsyncStorage.getItem(name),
+  setItem: (name, value) => (persistBlocked ? undefined : AsyncStorage.setItem(name, value)),
+  removeItem: (name) => (persistBlocked ? undefined : AsyncStorage.removeItem(name)),
+};
+
+/** Merge `fn` over one car's reminders (shared by the reminder CRUD actions). */
+function updateReminders(cars: Car[], carId: string, fn: (rs: Reminder[]) => Reminder[]): Car[] {
+  return cars.map((c) => (c.id === carId ? { ...c, reminders: fn(c.reminders) } : c));
+}
+
+// ---- wake timer: refresh when the soonest nextCleaning passes ----
+// Long setTimeouts are unreliable on Android (and JS timers pause in the
+// background anyway — the foreground listener covers that), so cap the delay
+// and simply re-arm after each refresh.
+export const WAKE_MAX_DELAY_MS = 6 * 3600_000;
+let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function armWakeTimer(): void {
+  if (wakeTimer) clearTimeout(wakeTimer);
+  wakeTimer = null;
+  const soonest = useStore
+    .getState()
+    .cars.reduce((m, c) => (c.nextCleaning != null && c.nextCleaning < m ? c.nextCleaning : m), Infinity);
+  if (!Number.isFinite(soonest)) return;
+  // +1s so getNextCleaning (strictly after `now`) has moved past this sweep.
+  const delay = Math.min(Math.max(soonest - Date.now() + 1000, 1000), WAKE_MAX_DELAY_MS);
+  wakeTimer = setTimeout(() => {
+    wakeTimer = null;
+    if (!useStore.getState().loadError) void useStore.getState().refreshAll();
+  }, delay);
+  // Node (jest) only: don't keep the process alive for this timer.
+  (wakeTimer as { unref?: () => void }).unref?.();
+}
+
+let rehydrating: Promise<void> | null = null;
+
+/**
+ * App came back to the foreground (wired up in state/lifecycle.ts). If saved
+ * state failed to load, retry hydration (success re-opens writes and runs
+ * init). Otherwise make sure init ran, then do a cheap non-forced refresh so
+ * nextCleaning and the planned notifications don't go stale while open.
+ */
+export function onAppActive(): Promise<void> {
+  const s = useStore.getState();
+  if (s.loadError) {
+    if (!rehydrating) {
+      rehydrating = Promise.resolve(useStore.persist.rehydrate()).finally(() => {
+        rehydrating = null;
+      });
+    }
+    return rehydrating;
+  }
+  if (!useStore.persist.hasHydrated()) return Promise.resolve(); // first hydration still running
+  if (!initPromise) return s.init(); // a previous init failed: retry it
+  return initPromise.then(() => useStore.getState().refreshAll());
+}
 
 export const useStore = create<StoreState>()(
   persist(
@@ -95,6 +191,7 @@ export const useStore = create<StoreState>()(
       showEmpty: false,
       seeded: false,
       cars: [],
+      loadError: false,
 
       init: () => {
         if (initPromise) return initPromise;
@@ -112,7 +209,7 @@ export const useStore = create<StoreState>()(
           await get().refreshAll(true);
         })()
           .catch((err) => {
-            console.warn('[sweepalert] init failed:', err);
+            log.warn('[sweepalert] init failed:', err);
             initPromise = null; // allow a later retry
           })
           .finally(() => set({ hydrated: true }));
@@ -124,6 +221,18 @@ export const useStore = create<StoreState>()(
       toggleEmpty: () => set((s) => ({ showEmpty: !s.showEmpty })),
 
       addCar: async ({ name, color, plate, location }) => {
+        // Saved state didn't load: the in-memory list isn't the user's real one,
+        // and a car added now would vanish on a successful retry while its
+        // scheduled alerts stayed behind (orphans nothing can cancel).
+        if (get().loadError) {
+          log.warn('[sweepalert] addCar refused: saved state failed to load');
+          return null;
+        }
+        // Hard cap so every car keeps a useful share of iOS's 64 pending alerts.
+        if (get().cars.length >= MAX_CARS) {
+          log.warn(`[sweepalert] addCar refused: already at MAX_CARS (${MAX_CARS})`);
+          return null;
+        }
         const id = uid('car');
         const car: Car = {
           id,
@@ -160,10 +269,12 @@ export const useStore = create<StoreState>()(
         // Remove first so an in-flight refreshCar sees the car is gone; the cancel
         // is queued after any in-flight sync for this car (per-car serialization).
         set((s) => ({ cars: s.cars.filter((c) => c.id !== carId) }));
+        armWakeTimer();
         await cancelCarNotifications(carId);
       },
 
       parkCar: async (carId, location) => {
+        if (get().loadError) return; // see addCar
         set((s) => ({
           cars: s.cars.map((c) =>
             c.id === carId ? { ...c, location, schedule: undefined, nextCleaning: undefined } : c,
@@ -174,49 +285,31 @@ export const useStore = create<StoreState>()(
 
       addReminder: async (carId, preset) => {
         set((s) => ({
-          cars: s.cars.map((c) =>
-            c.id === carId
-              ? {
-                  ...c,
-                  reminders: [
-                    ...c.reminders,
-                    {
-                      id: uid('rem'),
-                      carId,
-                      label: preset.label,
-                      offsetMinutes: preset.offsetMinutes,
-                      timeOfDayOverride: preset.timeOfDayOverride,
-                      channel: preset.channel,
-                      enabled: true,
-                    },
-                  ],
-                }
-              : c,
-          ),
+          cars: updateReminders(s.cars, carId, (rs) => [
+            ...rs,
+            {
+              id: uid('rem'),
+              carId,
+              label: preset.label,
+              offsetMinutes: preset.offsetMinutes,
+              timeOfDayOverride: preset.timeOfDayOverride,
+              channel: preset.channel,
+              enabled: true,
+            },
+          ]),
         }));
         await get().refreshCar(carId);
       },
 
       removeReminder: async (carId, reminderId) => {
-        set((s) => ({
-          cars: s.cars.map((c) =>
-            c.id === carId ? { ...c, reminders: c.reminders.filter((r) => r.id !== reminderId) } : c,
-          ),
-        }));
+        set((s) => ({ cars: updateReminders(s.cars, carId, (rs) => rs.filter((r) => r.id !== reminderId)) }));
         await get().refreshCar(carId);
       },
 
       toggleReminder: async (carId, reminderId) => {
         set((s) => ({
-          cars: s.cars.map((c) =>
-            c.id === carId
-              ? {
-                  ...c,
-                  reminders: c.reminders.map((r) =>
-                    r.id === reminderId ? { ...r, enabled: !r.enabled } : r,
-                  ),
-                }
-              : c,
+          cars: updateReminders(s.cars, carId, (rs) =>
+            rs.map((r) => (r.id === reminderId ? { ...r, enabled: !r.enabled } : r)),
           ),
         }));
         await get().refreshCar(carId);
@@ -224,15 +317,8 @@ export const useStore = create<StoreState>()(
 
       setReminderChannel: async (carId, reminderId, channel) => {
         set((s) => ({
-          cars: s.cars.map((c) =>
-            c.id === carId
-              ? {
-                  ...c,
-                  reminders: c.reminders.map((r) =>
-                    r.id === reminderId ? { ...r, channel, enabled: true } : r,
-                  ),
-                }
-              : c,
+          cars: updateReminders(s.cars, carId, (rs) =>
+            rs.map((r) => (r.id === reminderId ? { ...r, channel, enabled: true } : r)),
           ),
         }));
         await get().refreshCar(carId);
@@ -269,21 +355,42 @@ export const useStore = create<StoreState>()(
               : c,
           ),
         }));
+        armWakeTimer();
       },
 
-      refreshAll: async (force = false) => {
-        const cars = get().cars;
-        for (const c of cars) {
-          // Sequential to keep notification scheduling ordered & predictable.
-          // eslint-disable-next-line no-await-in-loop
-          await get().refreshCar(c.id, force);
+      refreshAll: (force = false) => {
+        // A non-forced refresh (foreground / wake timer) piggybacks on one that
+        // is already running over the same cars; a forced one, or one whose car
+        // list changed (addCar re-planning budgets), waits for it, then runs in full.
+        if (refreshing && !force && (refreshingIds === null || refreshingIds === carIdsKey(get().cars))) {
+          return refreshing;
         }
+        const run = (refreshing ?? Promise.resolve())
+          .catch(() => undefined)
+          .then(async () => {
+            const cars = get().cars;
+            if (refreshing === run) refreshingIds = carIdsKey(cars);
+            for (const c of cars) {
+              // Sequential to keep notification scheduling ordered & predictable.
+              await get().refreshCar(c.id, force);
+            }
+            armWakeTimer();
+          })
+          .finally(() => {
+            if (refreshing === run) {
+              refreshing = null;
+              refreshingIds = null;
+            }
+          });
+        refreshing = run;
+        refreshingIds = null; // queued: will read the current list when it starts
+        return run;
       },
     }),
     {
       name: 'sweepalert-v1',
       version: PERSIST_VERSION,
-      storage: createJSONStorage(() => AsyncStorage),
+      storage: createJSONStorage(() => guardedStorage),
       // Only persist the durable domain data; derived fields are recomputed.
       partialize: (s) => ({ theme: s.theme, showEmpty: s.showEmpty, seeded: s.seeded, cars: s.cars }),
       // < v3 drops cached schedules; < v4 marks existing installs as seeded.
@@ -295,10 +402,18 @@ export const useStore = create<StoreState>()(
         if (error) {
           // Hydration failed (storage read / parse / migrate threw): the store
           // still holds defaults, and any set() would persist them over the
-          // user's real data — so don't seed or write anything this launch.
-          console.warn('[sweepalert] hydration failed; skipping init:', error);
+          // user's real data — so keep writes blocked, don't seed, and flag the
+          // UI. onAppActive retries hydration when the app is foregrounded.
+          log.warn('[sweepalert] hydration failed; blocking writes and skipping init:', error);
+          persistBlocked = true;
+          useStore.setState({ loadError: true });
           return;
         }
+        // Real data is in memory now: open the write gate, then run the engine.
+        // init() is guarded by initPromise, so a later successful retry after a
+        // failure runs it, and a redundant rehydrate doesn't run it twice.
+        persistBlocked = false;
+        if (useStore.getState().loadError) useStore.setState({ loadError: false });
         useStore.getState().init();
       },
     },

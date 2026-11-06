@@ -6,7 +6,7 @@ import { Button } from '../components/Button';
 import { Mono, MonoLabel, T } from '../components/primitives';
 import { Screen } from '../components/Screen';
 import { CarsStackParamList } from '../navigation/types';
-import { useStore } from '../state/store';
+import { MAX_CARS, useStore } from '../state/store';
 import { CAR_PAINTS } from '../theme/tokens';
 import { useTheme } from '../theme/ThemeContext';
 
@@ -16,13 +16,17 @@ export function ManageCarsScreen({ navigation }: Props) {
   const { c, mono } = useTheme();
   const cars = useStore((s) => s.cars);
   const addCar = useStore((s) => s.addCar);
+  const loadError = useStore((s) => s.loadError);
 
   const [name, setName] = useState('');
   const [plate, setPlate] = useState('');
   const [paint, setPaint] = useState(0);
 
+  const atLimit = cars.length >= MAX_CARS;
+
   const onAdd = async () => {
-    await addCar({ name, plate: plate || undefined, color: CAR_PAINTS[paint] });
+    // addCar returns null at MAX_CARS or on loadError (the form is hidden then anyway).
+    if (!(await addCar({ name, plate: plate || undefined, color: CAR_PAINTS[paint] }))) return;
     setName('');
     setPlate('');
     setPaint(0);
@@ -60,44 +64,57 @@ export function ManageCarsScreen({ navigation }: Props) {
         </View>
       ))}
 
-      <View style={{ padding: 18, borderRadius: 22, backgroundColor: c.card, borderWidth: 1, borderColor: c.line, gap: 14 }}>
-        <MonoLabel>NEW CAR</MonoLabel>
-        <TextInput
-          value={name}
-          onChangeText={setName}
-          placeholder="Nickname — e.g. “Alli’s Subaru”"
-          placeholderTextColor={c.dim}
-          style={{ padding: 13, paddingHorizontal: 15, borderRadius: 14, backgroundColor: c.card2, fontSize: 14, color: c.ink }}
-        />
-        <TextInput
-          value={plate}
-          onChangeText={setPlate}
-          autoCapitalize="characters"
-          placeholder="MA plate"
-          placeholderTextColor={c.dim}
-          style={{ padding: 13, paddingHorizontal: 15, borderRadius: 14, backgroundColor: c.card2, fontSize: 14, color: c.ink, fontFamily: mono }}
-        />
-        <View style={{ gap: 9 }}>
-          <T style={{ fontSize: 12.5, fontWeight: '600', color: c.dim }}>Color</T>
-          <View style={{ flexDirection: 'row', gap: 9 }}>
-            {CAR_PAINTS.map((hex, i) => (
-              <Pressable
-                key={hex}
-                onPress={() => setPaint(i)}
-                style={{
-                  width: 34,
-                  height: 34,
-                  borderRadius: 11,
-                  backgroundColor: hex,
-                  borderWidth: 2,
-                  borderColor: paint === i ? c.accent : 'transparent',
-                }}
-              />
-            ))}
-          </View>
+      {atLimit || loadError ? (
+        // MAX_CARS keeps every car within its share of iOS's 64 pending alerts;
+        // while saved state failed to load, addCar refuses (state/store.ts).
+        <View style={{ padding: 18, borderRadius: 22, backgroundColor: c.card, borderWidth: 1, borderColor: c.line, gap: 6 }}>
+          <MonoLabel>NEW CAR</MonoLabel>
+          <T style={{ fontSize: 13, color: c.dim }}>
+            {loadError
+              ? 'Couldn’t load your saved cars yet. Adding cars is paused until they load.'
+              : `You’ve reached the ${MAX_CARS}-car limit. Remove a car to add another.`}
+          </T>
         </View>
-        <Button title="Add car" onPress={onAdd} style={{ borderRadius: 18, paddingVertical: 15 }} />
-      </View>
+      ) : (
+        <View style={{ padding: 18, borderRadius: 22, backgroundColor: c.card, borderWidth: 1, borderColor: c.line, gap: 14 }}>
+          <MonoLabel>NEW CAR</MonoLabel>
+          <TextInput
+            value={name}
+            onChangeText={setName}
+            placeholder="Nickname — e.g. “Alli’s Subaru”"
+            placeholderTextColor={c.dim}
+            style={{ padding: 13, paddingHorizontal: 15, borderRadius: 14, backgroundColor: c.card2, fontSize: 14, color: c.ink }}
+          />
+          <TextInput
+            value={plate}
+            onChangeText={setPlate}
+            autoCapitalize="characters"
+            placeholder="MA plate"
+            placeholderTextColor={c.dim}
+            style={{ padding: 13, paddingHorizontal: 15, borderRadius: 14, backgroundColor: c.card2, fontSize: 14, color: c.ink, fontFamily: mono }}
+          />
+          <View style={{ gap: 9 }}>
+            <T style={{ fontSize: 12.5, fontWeight: '600', color: c.dim }}>Color</T>
+            <View style={{ flexDirection: 'row', gap: 9 }}>
+              {CAR_PAINTS.map((hex, i) => (
+                <Pressable
+                  key={hex}
+                  onPress={() => setPaint(i)}
+                  style={{
+                    width: 34,
+                    height: 34,
+                    borderRadius: 11,
+                    backgroundColor: hex,
+                    borderWidth: 2,
+                    borderColor: paint === i ? c.accent : 'transparent',
+                  }}
+                />
+              ))}
+            </View>
+          </View>
+          <Button title="Add car" onPress={onAdd} style={{ borderRadius: 18, paddingVertical: 15 }} />
+        </View>
+      )}
     </Screen>
   );
 }

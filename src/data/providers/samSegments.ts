@@ -11,6 +11,8 @@
  */
 import Constants from 'expo-constants';
 
+import { fetchWithTimeout } from '../../services/http';
+
 import { resolveFromFeatures, SamFeature, SegmentMatch } from './samGeometry';
 
 export * from './samGeometry';
@@ -43,7 +45,7 @@ async function querySam(lat: number, lng: number): Promise<SamFeature[]> {
     returnGeometry: 'true',
     resultRecordCount: '40',
   });
-  const res = await fetch(`${samUrl()}?${params.toString()}`);
+  const res = await fetchWithTimeout(`${samUrl()}?${params.toString()}`);
   if (!res.ok) throw new Error(`SAM HTTP ${res.status}`);
   const json = (await res.json()) as { features?: SamFeature[]; error?: unknown };
   if (json.error) throw new Error(`SAM error ${JSON.stringify(json.error)}`);

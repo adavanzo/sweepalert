@@ -12,7 +12,7 @@ import { BostonProvider } from './BostonProvider';
 import { MockProvider } from './MockProvider';
 import { ReCollectProvider, RECOLLECT_CITIES } from './recollect';
 import { PickOptions } from './bostonMapping';
-import { StreetCleaningProvider } from './types';
+import { LookupFailedError, StreetCleaningProvider } from './types';
 
 export * from './types';
 
@@ -29,11 +29,22 @@ class GreaterBostonProvider implements StreetCleaningProvider {
   private cambridge = new ReCollectProvider(RECOLLECT_CITIES.cambridge);
 
   async getScheduleForLocation(lat: number, lng: number): Promise<CleaningSchedule | null> {
-    const city = (await reverseGeocodeParts(lat, lng)).city?.toLowerCase() ?? '';
+    const parts = await reverseGeocodeParts(lat, lng);
+    const city = parts.city?.toLowerCase() ?? '';
     if (city.includes('cambridge')) return this.cambridge.getScheduleForLocation(lat, lng);
     // Boston (and anything else) -> Boston, which returns null when out of its
     // boundary, so we never fabricate a schedule for an unsupported area.
-    return this.boston.getScheduleForLocation(lat, lng);
+    const { schedule, inBoston } = await this.boston.lookup(lat, lng);
+    // reverseGeocodeParts swallows failures (no city, no street). Routing still
+    // goes to Boston so its own SAM lookup / offline snapshot can answer, but
+    // Boston's "not mine" null is only authoritative when we know the city: with
+    // the geocoder down the point might be in Cambridge, so we can't say —
+    // unless Boston confirmed the point is inside one of its neighborhoods
+    // (then the null is its in-Boston "street has no schedule").
+    if (schedule === null && !inBoston && !parts.city && !parts.street) {
+      throw new LookupFailedError('reverse-geocode unavailable; cannot route the point to a city');
+    }
+    return schedule;
   }
 
   getNextCleaning(schedule: CleaningSchedule, from: Date): Date | null {

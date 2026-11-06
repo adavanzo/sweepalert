@@ -160,9 +160,17 @@ export const IOS_PENDING_LIMIT = 64;
 export const MAX_PER_CAR = 16;
 
 /**
+ * Most cars the app tracks. perCarCap floors at 1 alert per car, so past 64
+ * cars the total would exceed IOS_PENDING_LIMIT; 16 keeps every car at >= 4
+ * alerts (64 / 16) — enough for the next couple of sweeps. The store's addCar
+ * refuses beyond this.
+ */
+export const MAX_CARS = 16;
+
+/**
  * Per-car notification budget for `carCount` cars: an even share of the iOS
  * limit, at most MAX_PER_CAR, and at least 1 (so every car keeps its soonest
- * alert even past 64 cars, where the total can no longer fit).
+ * alert; with MAX_CARS enforced the share never drops below 4).
  */
 export function perCarCap(carCount: number): number {
   return Math.max(1, Math.min(MAX_PER_CAR, Math.floor(IOS_PENDING_LIMIT / Math.max(1, carCount))));

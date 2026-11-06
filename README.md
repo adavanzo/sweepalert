@@ -13,7 +13,7 @@ cleaning. Built with **React Native + Expo + TypeScript**. Ships with a seeded
 ## Quick start
 
 ```bash
-cd SweepAlert
+# from the repo root (it is the Expo app)
 npm install
 
 # start the Metro bundler
@@ -25,9 +25,13 @@ npm start
 Run the scheduling-engine unit tests and the type checker:
 
 ```bash
-npm test        # jest — scheduling engine (DST + season + fire times)
-npm run typecheck
+npm test          # jest — scheduling engine, providers, store, persistence
+npm run typecheck # tsc --noEmit
+npm run lint      # eslint (eslint-config-expo flat config, eslint.config.js)
 ```
+
+CI (`.github/workflows/ci.yml`) runs `npm ci`, then lint, typecheck and tests on
+every push and pull request.
 
 ### What works where
 
@@ -52,42 +56,72 @@ npx expo run:ios      # or: npx expo run:android  (physical NFC device)
 ## Architecture
 
 ```
-SweepAlert/
-├── App.tsx                     # providers + navigation container
+sweepalert/                     # repo root = the Expo app
+├── App.tsx                     # providers + navigation container + lifecycle
 ├── index.ts                    # Expo entry
-├── app.json                    # permissions, plugins, ArcGIS endpoint slots
+├── app.json                    # permissions, plugins, endpoint config (extra)
+├── eslint.config.js            # eslint-config-expo (flat)
+├── .github/workflows/ci.yml    # lint + typecheck + tests
+├── plugins/
+│   └── withFreeTeamSigning.js  # strips entitlements a free Apple team can't sign
 ├── __tests__/
-│   ├── scheduling.test.ts      # engine unit tests (DST, season, fire times)
-│   └── bostonMapping.test.ts   # live CKAN row -> schedule translation
+│   ├── scheduling.test.ts        # engine unit tests (DST, season, fire times)
+│   ├── upcoming.test.ts          # next-N cleanings + notification planner
+│   ├── bostonMapping.test.ts     # live CKAN row -> schedule translation
+│   ├── samSegments.test.ts       # SAM geometry / side-of-street math
+│   ├── recollect.test.ts         # ReCollect (Cambridge) mapping
+│   ├── coverage.test.ts          # Boston boundary gate
+│   ├── snapshotFallback.test.ts  # offline snapshot distance gate
+│   ├── providerContract.test.ts  # null vs LookupFailedError contract
+│   ├── store.test.ts             # real Zustand store: init, seeding, refresh
+│   ├── persistence.test.ts       # persisted shape + migrations
+│   ├── serial.test.ts            # per-key serialization
+│   ├── http.test.ts              # fetch timeout wrapper
+│   └── log.test.ts               # production log redaction
 └── src/
     ├── types.ts                # Car / ParkingSpot / CleaningSchedule / Reminder
     ├── theme/
     │   ├── tokens.ts           # design tokens (light/dark) from the design
     │   └── ThemeContext.tsx
+    ├── hooks/
+    │   └── useNow.ts           # ticking clock for live countdowns
     ├── data/                   # ── schedule providers ──
     │   ├── boston-snapshot.json  # bundled offline Boston blocks
-    │   ├── snapshot.ts           # nearest-block + schedule builders
+    │   ├── snapshot.ts           # nearest-block (distance-gated) + builders
+    │   ├── coverage.ts           # isWithinBoston boundary check
     │   └── providers/
-    │       ├── types.ts          # StreetCleaningProvider interface
-    │       ├── BostonProvider.ts # live Analyze Boston lookup + offline fallback
-    │       ├── bostonApi.ts      # CKAN datastore client + config
-    │       ├── bostonMapping.ts  # pure row -> CleaningSchedule (unit-tested)
-    │       ├── MockProvider.ts   # pure offline demo data
-    │       └── index.ts          # provider registry
+    │       ├── types.ts            # StreetCleaningProvider + LookupFailedError
+    │       ├── index.ts            # registry + Greater Boston city router
+    │       ├── BostonProvider.ts   # SAM + Analyze Boston lookup, offline fallback
+    │       ├── bostonApi.ts        # CKAN datastore client + config
+    │       ├── bostonMapping.ts    # pure row -> CleaningSchedule (unit-tested)
+    │       ├── bostonNeighborhoods.ts # BPDA neighborhood point-in-polygon
+    │       ├── samSegments.ts      # SAM street-segments ArcGIS client
+    │       ├── samGeometry.ts      # pure SAM geometry + parsing
+    │       ├── recollect.ts        # ReCollect provider (Cambridge)
+    │       ├── recollectMapping.ts # pure ReCollect events -> schedule
+    │       └── MockProvider.ts     # pure offline demo data
     ├── services/              # ── engine + device ──
-    │   ├── scheduling.ts         # getNextCleaning / computeFireTimes (luxon)
+    │   ├── scheduling.ts         # next cleaning / fire times / notification plan
     │   ├── presets.ts            # reminder presets
     │   ├── format.ts             # countdown / status / upcoming view-models
     │   ├── location.ts           # expo-location + reverse-geocode
     │   ├── nfc.ts                # feature-detected NFC
     │   ├── notifications.ts      # expo-notifications schedule/cancel/sync
+    │   ├── http.ts               # fetch with a hard timeout
+    │   ├── log.ts                # logger that keeps addresses out of prod logs
+    │   ├── serial.ts             # per-key task serialization
     │   └── seed.ts               # seeded demo cars
     ├── state/
-    │   └── store.ts              # Zustand + AsyncStorage; owns reschedule glue
-    ├── components/             # Screen, Button, Card, Toggle, Pill, …
+    │   ├── store.ts              # Zustand + AsyncStorage; refresh + reschedule glue
+    │   ├── persistence.ts        # persisted shape, version + migrations
+    │   └── lifecycle.ts          # AppState foreground -> onAppActive
+    ├── components/             # Screen, Button, primitives (Card, Toggle, Pill, …)
     ├── navigation/            # bottom tabs + Cars stack, custom pill tab bar
     └── screens/               # MyCars, Park, CarDetail, ReminderEditor,
-                               # ManageCars, Alerts, Settings
+        │                      # ManageCars, Alerts, Lookup, Settings
+        └── park/              # Park screen pieces: map, capture controls,
+                               # detected block, street picker, car picker, save
 ```
 
 ### The scheduling engine (`src/services/scheduling.ts`)
@@ -115,6 +149,15 @@ planCarNotifications(car, now): PlannedNotification[]  // what to schedule
   app isn't reopened; the
   window rolls forward on every launch and whenever a car is moved
   (`store.refreshCar` → `notifications.syncCarNotifications`).
+- **16-car limit** — `MAX_CARS = 16` (`scheduling.ts`) so every car keeps at
+  least 4 of the 64 pending alerts (`perCarCap`). `addCar` refuses past it and
+  Manage Cars swaps the add form for a "reached the 16-car limit" note.
+- **Staying fresh while open** — on every background → active transition
+  (`state/lifecycle.ts` → `store.onAppActive`) the app runs a cheap non-forced
+  `refreshAll` from cached schedules (or retries a failed storage load), and a
+  wake timer (`armWakeTimer`, capped at 6 h and re-armed after each refresh)
+  refreshes when the soonest sweep passes, so countdowns and the planned
+  notifications roll forward without a relaunch.
 
 Run `npm test` to see the DST / season / fire-time cases.
 
@@ -146,10 +189,27 @@ interface StreetCleaningProvider {
   per side); the parked parcel's house-number parity selects the side. These
   concrete dates are stored as `explicitDates` on the schedule, which the engine
   uses directly (`src/data/providers/recollect.ts`, mapping in
-  `recollectMapping.ts`). ⚠️ ReCollect's API is unofficial — every call fails
-  soft to "no data for this location". (Somerville uses ReCollect too; its
-  service id is still TODO.)
+  `recollectMapping.ts`). ⚠️ ReCollect's API is unofficial — a failed call
+  surfaces as a lookup failure (`LookupFailedError`), never as made-up data; an
+  address ReCollect doesn't know is "no schedule". (Somerville uses ReCollect
+  too; its service id is still TODO.)
 - **`MockProvider`** serves the bundled snapshot only (tests + first-run demo).
+
+**No schedule vs. lookup failed.** The provider contract
+(`src/data/providers/types.ts`, tested in `__tests__/providerContract.test.ts`)
+separates two outcomes:
+
+- **`null`** is authoritative: the point is outside coverage, or the resolved
+  street / address has no sweeping schedule. The store clears the car's schedule
+  and the card shows **No schedule** (`OUTSIDE COVERAGE · NO SCHEDULE`); no
+  alerts are planned.
+- **A thrown `LookupFailedError`** means "couldn't tell" (offline, timeout,
+  service error, geocoder down with no city to route to). The store logs it and
+  **keeps the car's cached schedule** and its alerts; the next launch (which
+  re-resolves every car) or re-park tries again. A freshly parked car has no
+  cached schedule (`parkCar` clears it), so it shows no schedule until a lookup
+  succeeds — and because it has nothing cached, each foreground refresh
+  retries it.
 
 **Multi-city router.** `getProvider()` returns a `GreaterBostonProvider` that
 reverse-geocodes the point to a city and delegates: `Cambridge → ReCollect`,
@@ -227,6 +287,17 @@ Override those to target a mirror or an updated resource id — no code change.
 
 ---
 
+## Reminders
+
+Each car carries its own stack of reminders; toggle each one, switch it between
+**Push** and **Critical alert**, or remove it. Adding a reminder offers **fixed
+presets only** — the editor's chips are `ADDABLE_PRESETS` in
+`src/services/presets.ts` (1 day before, 3 hours before, 1 hour before, 15 min
+before, at sweep start). There is no custom offset or time picker yet; to offer
+a new timing, add a preset there.
+
+---
+
 ## Data model (persisted via AsyncStorage)
 
 ```ts
@@ -265,7 +336,7 @@ lookup fails offline.
 
 ## Notes on versions
 
-Pinned to **Expo SDK 51** for broad stability. If your installed Expo differs,
+Pinned to **Expo SDK 54** (React Native 0.81, React 19.1). If your installed Expo differs,
 align native deps with:
 
 ```bash

@@ -34,8 +34,8 @@ export function shouldSeed(s: SeedState): boolean {
  *  - < v4: drop cached schedules that came from the offline snapshot for a car
  *    parked farther than SNAPSHOT_MAX_KM from that block. Older builds returned
  *    the nearest snapshot block at any distance (made-up data), and since the
- *    store now keeps a cached schedule when a lookup returns null, such a
- *    schedule would otherwise never be corrected.
+ *    store keeps a cached schedule when a lookup fails (offline), such a
+ *    schedule could otherwise linger uncorrected.
  */
 export function migratePersisted(persisted: unknown, fromVersion: number): unknown {
   const p = persisted as { cars?: Car[]; seeded?: boolean } | undefined;
