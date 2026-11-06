@@ -78,11 +78,16 @@ export function getNextCleaning(schedule: CleaningSchedule, from: Date): Date | 
 /**
  * The instant a reminder should fire for a given cleaning datetime.
  *
- *  - offsetMinutes is subtracted from the cleaning instant.
+ *  - offsetMinutes is subtracted from the cleaning instant. Whole days
+ *    (offsetMinutes / 1440) are subtracted as calendar days in the schedule's
+ *    zone and the remainder as elapsed minutes, so "1 day before" an 8:00 sweep
+ *    is 8:00 the previous day even across a DST change (not 7:00 or 9:00).
  *  - if timeOfDayOverride ("HH:mm") is set, the resulting day's clock time is
  *    pinned to it (this is how "night before at 8pm" works: 1 day offset, then
  *    the clock forced to 20:00). The override is applied in the schedule's zone
  *    so it survives DST.
+ *
+ * See services/reminderTiming.ts for the editor's model of these two fields.
  */
 export function computeFireTime(
   schedule: CleaningSchedule,
@@ -90,7 +95,9 @@ export function computeFireTime(
   reminder: Pick<Reminder, 'offsetMinutes' | 'timeOfDayOverride'>,
 ): Date {
   const zone = schedule.timezone;
-  let dt = DateTime.fromJSDate(cleaning, { zone }).minus({ minutes: reminder.offsetMinutes });
+  const days = Math.floor(reminder.offsetMinutes / 1440);
+  const minutes = reminder.offsetMinutes - days * 1440;
+  let dt = DateTime.fromJSDate(cleaning, { zone }).minus({ days }).minus({ minutes });
   if (reminder.timeOfDayOverride) {
     const [h, m] = reminder.timeOfDayOverride.split(':').map((n) => parseInt(n, 10));
     dt = dt.set({ hour: h, minute: m, second: 0, millisecond: 0 });
@@ -200,6 +207,10 @@ export function planCarNotifications(
   const plan: PlannedNotification[] = [];
   for (const cleaning of getUpcomingCleanings(schedule, now, cleaningsAhead)) {
     for (const f of computeFireTimes(schedule, cleaning, car.reminders, now)) {
+      // A same-day clock override at/after the sweep start (e.g. "day of at
+      // 9am" for an 8am sweep, possible after a re-park to a block with an
+      // earlier window) would warn after the fact: skip it.
+      if (f.fireAt.getTime() > cleaning.getTime()) continue;
       if (!f.past) plan.push({ reminder: f.reminder, cleaning, fireAt: f.fireAt });
     }
   }

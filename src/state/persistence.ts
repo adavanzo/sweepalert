@@ -3,10 +3,11 @@
  * imports) so they are unit-testable under node — see __tests__/persistence.test.ts.
  */
 import { blockById, haversineKm, SNAPSHOT_MAX_KM } from '../data/snapshot';
+import { DefaultReminder, initialDefaultReminders } from '../services/presets';
 import { Car } from '../types';
 
 /** Current persisted-state version (zustand persist `version`). */
-export const PERSIST_VERSION = 4;
+export const PERSIST_VERSION = 5;
 
 export interface SeedState {
   cars: Car[];
@@ -36,15 +37,21 @@ export function shouldSeed(s: SeedState): boolean {
  *    the nearest snapshot block at any distance (made-up data), and since the
  *    store keeps a cached schedule when a lookup fails (offline), such a
  *    schedule could otherwise linger uncorrected.
+ *  - < v5: introduces global `defaultReminders`; older installs get the
+ *    initial default (night before at 8pm, push), which is what addCar used to
+ *    hardcode. Existing cars' reminders are left untouched.
  */
 export function migratePersisted(persisted: unknown, fromVersion: number): unknown {
-  const p = persisted as { cars?: Car[]; seeded?: boolean } | undefined;
+  const p = persisted as { cars?: Car[]; seeded?: boolean; defaultReminders?: DefaultReminder[] } | undefined;
   if (p?.cars && fromVersion < 3) {
     p.cars = p.cars.map((c) => ({ ...c, schedule: undefined, nextCleaning: undefined }));
   }
   if (p && Array.isArray(p.cars) && fromVersion < 4) {
     p.seeded = true;
     p.cars = p.cars.map((c) => (isFabricatedSnapshot(c) ? { ...c, schedule: undefined, nextCleaning: undefined } : c));
+  }
+  if (p && typeof p === 'object' && fromVersion < 5 && !Array.isArray(p.defaultReminders)) {
+    p.defaultReminders = initialDefaultReminders();
   }
   return p;
 }

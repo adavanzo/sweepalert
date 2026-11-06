@@ -4,7 +4,7 @@
  * rather than to be a general UI kit.
  */
 import React from 'react';
-import { StyleProp, Text, TextProps, TextStyle, View, ViewProps, ViewStyle } from 'react-native';
+import { Pressable, StyleProp, Text, TextProps, TextStyle, View, ViewProps, ViewStyle } from 'react-native';
 
 import { useTheme } from '../theme/ThemeContext';
 
@@ -46,9 +46,13 @@ export function MonoLabel({ children, style }: { children: React.ReactNode; styl
 }
 
 /** Monospace body text (plate numbers, next-sweep labels). */
-export function Mono({ children, style }: { children: React.ReactNode; style?: StyleProp<TextStyle> }) {
+export function Mono({ children, style, testID }: { children: React.ReactNode; style?: StyleProp<TextStyle>; testID?: string }) {
   const { mono } = useTheme();
-  return <Text style={[{ fontFamily: mono }, style]}>{children}</Text>;
+  return (
+    <Text testID={testID} style={[{ fontFamily: mono }, style]}>
+      {children}
+    </Text>
+  );
 }
 
 /** Sans text with sensible default color. */
@@ -96,11 +100,27 @@ export function Pill({
 }
 
 /** iOS-style on/off toggle track+knob from the design. */
-export function Toggle({ on, onPress }: { on: boolean; onPress: () => void }) {
+export function Toggle({
+  on,
+  onPress,
+  testID,
+  accessibilityLabel,
+}: {
+  on: boolean;
+  onPress: () => void;
+  testID?: string;
+  accessibilityLabel?: string;
+}) {
   const { c } = useTheme();
+  // Pressable (not onTouchEnd) so it also responds to mouse clicks on web.
   return (
-    <View
-      onTouchEnd={onPress}
+    <Pressable
+      onPress={onPress}
+      testID={testID}
+      accessibilityRole="switch"
+      accessibilityLabel={accessibilityLabel}
+      accessibilityState={{ checked: on }}
+      hitSlop={6}
       style={{
         width: 44,
         height: 26,
@@ -125,6 +145,6 @@ export function Toggle({ on, onPress }: { on: boolean; onPress: () => void }) {
           elevation: 2,
         }}
       />
-    </View>
+    </Pressable>
   );
 }

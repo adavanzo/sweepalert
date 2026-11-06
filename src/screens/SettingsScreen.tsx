@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
 import { Mono, MonoLabel, T, Toggle } from '../components/primitives';
+import { DefaultRemindersCard } from '../components/reminders/DefaultRemindersCard';
 import { Screen } from '../components/Screen';
 import { ACTIVE_PROVIDER_ID, getProvider } from '../data/providers';
 import * as loc from '../services/location';
@@ -96,11 +97,14 @@ export function SettingsScreen() {
         />
       </View>
 
+      {/* Default reminders */}
+      <DefaultRemindersCard />
+
       {/* Defaults */}
       <View style={{ padding: 18, borderRadius: 22, backgroundColor: c.card, borderWidth: 1, borderColor: c.line, gap: 15 }}>
         <MonoLabel>DEFAULTS</MonoLabel>
         <Row title="Dark mode" sub={isDark ? 'Dark' : 'Light'}>
-          <Toggle on={isDark} onPress={toggleTheme} />
+          <Toggle on={isDark} onPress={toggleTheme} testID="settings-dark-mode" accessibilityLabel="Dark mode" />
         </Row>
         <View style={{ height: 1, backgroundColor: c.line }} />
         <Row title="Season awareness" sub="Boston sweeps April 1 – Nov 30">

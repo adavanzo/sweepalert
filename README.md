@@ -67,13 +67,15 @@ sweepalert/                     # repo root = the Expo app
 ├── __tests__/
 │   ├── scheduling.test.ts        # engine unit tests (DST, season, fire times)
 │   ├── upcoming.test.ts          # next-N cleanings + notification planner
+│   ├── reminderTiming.test.ts    # custom timings: round trips, labels, validation, DST
+│   ├── notificationChannels.test.ts # Push/Urgent delivery routing
 │   ├── bostonMapping.test.ts     # live CKAN row -> schedule translation
 │   ├── samSegments.test.ts       # SAM geometry / side-of-street math
 │   ├── recollect.test.ts         # ReCollect (Cambridge) mapping
 │   ├── coverage.test.ts          # Boston boundary gate
 │   ├── snapshotFallback.test.ts  # offline snapshot distance gate
 │   ├── providerContract.test.ts  # null vs LookupFailedError contract
-│   ├── store.test.ts             # real Zustand store: init, seeding, refresh
+│   ├── store.test.ts             # real Zustand store: init, seeding, refresh, defaults
 │   ├── persistence.test.ts       # persisted shape + migrations
 │   ├── serial.test.ts            # per-key serialization
 │   ├── http.test.ts              # fetch timeout wrapper
@@ -103,7 +105,9 @@ sweepalert/                     # repo root = the Expo app
     │       └── MockProvider.ts     # pure offline demo data
     ├── services/              # ── engine + device ──
     │   ├── scheduling.ts         # next cleaning / fire times / notification plan
-    │   ├── presets.ts            # reminder presets
+    │   ├── presets.ts            # reminder presets + initial default reminders
+    │   ├── reminderTiming.ts     # custom reminder timing model, labels, validation
+    │   ├── notificationChannels.ts # Push/Urgent -> Android channel + iOS level
     │   ├── format.ts             # countdown / status / upcoming view-models
     │   ├── location.ts           # expo-location + reverse-geocode
     │   ├── nfc.ts                # feature-detected NFC
@@ -117,6 +121,8 @@ sweepalert/                     # repo root = the Expo app
     │   ├── persistence.ts        # persisted shape, version + migrations
     │   └── lifecycle.ts          # AppState foreground -> onAppActive
     ├── components/             # Screen, Button, primitives (Card, Toggle, Pill, …)
+    │   └── reminders/          # ReminderList, TimingEditor, ChannelPicker,
+    │                           # DefaultRemindersCard (car editor + Settings)
     ├── navigation/            # bottom tabs + Cars stack, custom pill tab bar
     └── screens/               # MyCars, Park, CarDetail, ReminderEditor,
         │                      # ManageCars, Alerts, Lookup, Settings
@@ -289,12 +295,49 @@ Override those to target a mirror or an updated resource id — no code change.
 
 ## Reminders
 
-Each car carries its own stack of reminders; toggle each one, switch it between
-**Push** and **Critical alert**, or remove it. Adding a reminder offers **fixed
-presets only** — the editor's chips are `ADDABLE_PRESETS` in
-`src/services/presets.ts` (1 day before, 3 hours before, 1 hour before, 15 min
-before, at sweep start). There is no custom offset or time picker yet; to offer
-a new timing, add a preset there.
+Each car carries its own stack of reminders: toggle each one, switch it between
+**Push** and **Urgent**, remove it, or tap its label to change its time.
+
+- **Presets + custom.** The editor's chips are `ADDABLE_PRESETS`
+  (`src/services/presets.ts`); **Custom…** opens an inline editor (days before
+  0–7, then either *Before sweep* by hours/minutes or *At a time* on a clock, in
+  5-minute steps) with a live preview ("Fires Wed 7:00 PM for the Thu 8:00 AM
+  sweep"). The model is `src/services/reminderTiming.ts`: *before* =
+  `offsetMinutes = days·1440 + minutes`; *at* = `offsetMinutes = days·1440` +
+  `timeOfDayOverride`. Whole days are calendar days, so "1 day before" an 8am
+  sweep is 8am the day before even across a DST change.
+- **Same-day clock times** must be before the sweep starts. With a known
+  schedule the editor rejects a time at/after `windowStart`; without one (global
+  defaults, unparked car) it is allowed with a warning, and the planner skips any
+  fire time that would land after the sweep started (e.g. after re-parking on a
+  block that sweeps earlier).
+- **No duplicates.** A car (or the defaults) can't have two reminders with the
+  same `offsetMinutes` + override; the editor says so instead.
+- **Global defaults.** Settings → *Default reminders* holds the stack every new
+  car starts with (initially "Night before at 8pm", push; older installs get the
+  same via migration v5). Editing defaults doesn't touch existing cars;
+  *Apply to all cars* (inline confirm) replaces every car's reminders with the
+  defaults and reschedules. The demo cars keep their own seeded reminders.
+
+### What "Urgent" actually does
+
+The stored channel value is still `alarm` (no data migration needed); only the
+label changed. Urgent is **not** an iOS Critical Alert — those need an
+Apple-approved entitlement — and it can't bypass silent mode.
+
+- **Android:** routed to the `sweep-urgent` channel (MAX importance, vibration,
+  lights); normal reminders use `sweep`. Both channels are created idempotently
+  before scheduling. (Android won't change an existing channel's importance, so
+  installs that already created `sweep` keep its old MAX importance.)
+- **iOS:** the notification is sent with `interruptionLevel: 'timeSensitive'`,
+  which breaks through Focus when the user allows it. That needs the
+  `com.apple.developer.usernotifications.time-sensitive` entitlement, which this
+  build deliberately does **not** add (it may break free-team signing, see
+  `plugins/withFreeTeamSigning.js`); without it iOS delivers urgent reminders as
+  normal (`active`) notifications. With a paid team, add
+  `"entitlements": { "com.apple.developer.usernotifications.time-sensitive": true }`
+  under `expo.ios` in `app.json`, enable *Time Sensitive Notifications* for the
+  App ID, and rebuild (`npx expo run:ios`).
 
 ---
 
@@ -307,8 +350,8 @@ CleaningSchedule { blockId, rules, windowStart, windowEnd, side, season, timezon
 Reminder       { id, carId, label, offsetMinutes, timeOfDayOverride?, channel, enabled, notificationId? }
 ```
 
-Zustand persists only the durable domain data (plus a `seeded` flag so demo
-cars are seeded only once); schedules, next-cleaning times, and OS notification
+Zustand persists only the durable domain data (cars, global `defaultReminders`,
+plus a `seeded` flag so demo cars are seeded only once); schedules, next-cleaning times, and OS notification
 IDs are refreshed on launch by `store.init()`, keeping the cached schedule if the
 lookup fails offline.
 

@@ -11,10 +11,14 @@ export function Button({
   variant = 'primary',
   style,
   textStyle,
+  testID,
+  accessibilityLabel,
 }: {
   title: string;
   onPress: () => void;
   variant?: Variant;
+  testID?: string;
+  accessibilityLabel?: string;
   style?: StyleProp<ViewStyle>;
   textStyle?: StyleProp<TextStyle>;
 }) {
@@ -42,6 +46,9 @@ export function Button({
   return (
     <Pressable
       onPress={onPress}
+      testID={testID}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? title}
       style={({ pressed }) => [
         {
           paddingVertical: 16,

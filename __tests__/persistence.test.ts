@@ -33,8 +33,18 @@ describe('shouldSeed', () => {
 });
 
 describe('migratePersisted', () => {
-  it('is at version 4', () => {
-    expect(PERSIST_VERSION).toBe(4);
+  it('is at version 5', () => {
+    expect(PERSIST_VERSION).toBe(5);
+  });
+
+  it('gives pre-v5 installs the initial default reminder, and keeps existing ones', () => {
+    const out = migratePersisted({ cars: [car('a')], seeded: true }, 4) as { defaultReminders: unknown[]; cars: Car[] };
+    expect(out.defaultReminders).toEqual([
+      expect.objectContaining({ label: 'Night before at 8pm', offsetMinutes: 1440, timeOfDayOverride: '20:00', channel: 'push' }),
+    ]);
+    expect(out.cars[0].reminders).toEqual([]); // cars are untouched
+    const custom = [{ id: 'd1', label: '1 hour before', offsetMinutes: 60, channel: 'alarm' }];
+    expect(migratePersisted({ cars: [], defaultReminders: custom }, 4)).toMatchObject({ defaultReminders: custom });
   });
 
   it('marks existing installs (with a cars array) as seeded, even when empty', () => {
@@ -74,7 +84,8 @@ describe('migratePersisted', () => {
   });
 
   it('leaves state without cars alone and tolerates undefined', () => {
-    expect(migratePersisted({ theme: 'dark' }, 3)).toEqual({ theme: 'dark' });
+    expect(migratePersisted({ theme: 'dark' }, 3)).toEqual({ theme: 'dark', defaultReminders: expect.any(Array) });
+    expect(migratePersisted({ theme: 'dark' }, 5)).toEqual({ theme: 'dark' });
     expect(migratePersisted(undefined, 3)).toBeUndefined();
   });
 });

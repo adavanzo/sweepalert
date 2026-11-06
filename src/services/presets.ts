@@ -31,6 +31,16 @@ export const ADDABLE_PRESETS = REMINDER_PRESETS.filter((p) =>
   ),
 );
 
+/** A global default reminder (Settings): a preset with a stable id for editing. */
+export interface DefaultReminder extends ReminderPreset {
+  id: string;
+}
+
+/** What new installs (and pre-v5 installs, via migration) start with. */
+export function initialDefaultReminders(): DefaultReminder[] {
+  return [{ id: 'def_night_before', label: 'Night before at 8pm', offsetMinutes: 24 * 60, timeOfDayOverride: '20:00', channel: 'push' }];
+}
+
 export function presetByLabel(label: string): ReminderPreset | undefined {
   return REMINDER_PRESETS.find((p) => p.label === label);
 }

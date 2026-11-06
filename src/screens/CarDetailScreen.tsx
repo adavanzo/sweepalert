@@ -131,7 +131,7 @@ export function CarDetailScreen({ route, navigation }: Props) {
               >
                 <T style={{ fontSize: 13, fontWeight: '600', color: r.enabled ? c.ink : c.dim }}>{r.label}</T>
                 <Mono style={{ fontSize: 11, color: c.dim }}>
-                  {r.enabled ? (r.channel === 'push' ? 'PUSH' : 'CRITICAL') : 'OFF'}
+                  {r.enabled ? (r.channel === 'push' ? 'PUSH' : 'URGENT') : 'OFF'}
                 </Mono>
               </View>
             ))}

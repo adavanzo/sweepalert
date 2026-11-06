@@ -16,7 +16,8 @@ import { getProvider } from '../data/providers';
 import { log } from '../services/log';
 import { syncCarNotifications, cancelCarNotifications } from '../services/notifications';
 import { seedCars, uid } from '../services/seed';
-import { ReminderPreset } from '../services/presets';
+import { DefaultReminder, initialDefaultReminders, ReminderPreset } from '../services/presets';
+import { sameTiming } from '../services/reminderTiming';
 import { MAX_CARS, perCarCap } from '../services/scheduling';
 import { migratePersisted, PERSIST_VERSION, shouldSeed } from './persistence';
 
@@ -32,6 +33,8 @@ interface StoreState {
   /** Persisted: demo cars were seeded once (or this install predates the flag). */
   seeded: boolean;
   cars: Car[];
+  /** Persisted: reminders every new car starts with (Settings → Default reminders). */
+  defaultReminders: DefaultReminder[];
   /**
    * Not persisted: reading saved state failed this session. Writes are blocked
    * (so defaults never overwrite the user's real data) and hydration is retried
@@ -57,10 +60,28 @@ interface StoreState {
   parkCar: (carId: string, location: ParkingSpot) => Promise<void>;
 
   // ---- reminder CRUD (per car) ----
-  addReminder: (carId: string, preset: ReminderPreset) => Promise<void>;
+  /**
+   * Adds a preset or custom reminder. Returns false (no-op) when the car
+   * already has one with the same timing (offsetMinutes + override).
+   */
+  addReminder: (carId: string, preset: ReminderPreset) => Promise<boolean>;
+  /** Change a reminder's timing/label (and channel). False on a duplicate timing. */
+  updateReminder: (carId: string, reminderId: string, patch: ReminderPatch) => Promise<boolean>;
   removeReminder: (carId: string, reminderId: string) => Promise<void>;
   toggleReminder: (carId: string, reminderId: string) => Promise<void>;
   setReminderChannel: (carId: string, reminderId: string, channel: Reminder['channel']) => Promise<void>;
+
+  // ---- global default reminders ----
+  /** False on a duplicate timing or while saved state failed to load. */
+  addDefaultReminder: (preset: ReminderPreset) => boolean;
+  updateDefaultReminder: (id: string, patch: ReminderPatch) => boolean;
+  removeDefaultReminder: (id: string) => void;
+  setDefaultReminderChannel: (id: string, channel: Reminder['channel']) => void;
+  /**
+   * Replace every car's reminders with the defaults (fresh ids) and resync
+   * each car's notifications. False (no-op) while saved state failed to load.
+   */
+  applyDefaultsToAllCars: () => Promise<boolean>;
 
   // ---- engine glue ----
   /** Recompute schedule + nextCleaning for a car and resync notifications. */
@@ -70,6 +91,35 @@ interface StoreState {
    * when the app returns to the foreground and when a car's nextCleaning passes.
    */
   refreshAll: (force?: boolean) => Promise<void>;
+}
+
+export interface ReminderPatch {
+  label: string;
+  offsetMinutes: number;
+  timeOfDayOverride?: string;
+  channel?: Reminder['channel'];
+}
+
+/** Fresh, enabled car reminders from presets (addCar / applyDefaultsToAllCars). */
+function remindersFrom(carId: string, presets: ReminderPreset[]): Reminder[] {
+  return presets.map((p) => ({
+    id: uid('rem'),
+    carId,
+    label: p.label,
+    offsetMinutes: p.offsetMinutes,
+    timeOfDayOverride: p.timeOfDayOverride || undefined,
+    channel: p.channel,
+    enabled: true,
+  }));
+}
+
+/** Does any item other than `exceptId` already have this timing? */
+function hasTiming<T extends { id: string; offsetMinutes: number; timeOfDayOverride?: string }>(
+  items: T[],
+  timing: Pick<Reminder, 'offsetMinutes' | 'timeOfDayOverride'>,
+  exceptId?: string,
+): boolean {
+  return items.some((r) => r.id !== exceptId && sameTiming(r, timing));
 }
 
 async function resolveSchedule(car: Car, force = false): Promise<Car> {
@@ -191,6 +241,7 @@ export const useStore = create<StoreState>()(
       showEmpty: false,
       seeded: false,
       cars: [],
+      defaultReminders: initialDefaultReminders(),
       loadError: false,
 
       init: () => {
@@ -240,17 +291,7 @@ export const useStore = create<StoreState>()(
           color,
           plate: plate ?? 'MA — — —',
           location,
-          reminders: [
-            {
-              id: uid('rem'),
-              carId: id,
-              label: 'Night before at 8pm',
-              offsetMinutes: 24 * 60,
-              timeOfDayOverride: '20:00',
-              channel: 'push',
-              enabled: true,
-            },
-          ],
+          reminders: remindersFrom(id, get().defaultReminders),
           createdAt: Date.now(),
         };
         set((s) => ({ cars: [...s.cars, car] }));
@@ -284,21 +325,34 @@ export const useStore = create<StoreState>()(
       },
 
       addReminder: async (carId, preset) => {
+        const car = get().cars.find((c) => c.id === carId);
+        if (!car || hasTiming(car.reminders, preset)) return false;
+        set((s) => ({ cars: updateReminders(s.cars, carId, (rs) => [...rs, ...remindersFrom(carId, [preset])]) }));
+        await get().refreshCar(carId);
+        return true;
+      },
+
+      updateReminder: async (carId, reminderId, patch) => {
+        const car = get().cars.find((c) => c.id === carId);
+        if (!car || !car.reminders.some((r) => r.id === reminderId)) return false;
+        if (hasTiming(car.reminders, patch, reminderId)) return false;
         set((s) => ({
-          cars: updateReminders(s.cars, carId, (rs) => [
-            ...rs,
-            {
-              id: uid('rem'),
-              carId,
-              label: preset.label,
-              offsetMinutes: preset.offsetMinutes,
-              timeOfDayOverride: preset.timeOfDayOverride,
-              channel: preset.channel,
-              enabled: true,
-            },
-          ]),
+          cars: updateReminders(s.cars, carId, (rs) =>
+            rs.map((r) =>
+              r.id === reminderId
+                ? {
+                    ...r,
+                    label: patch.label,
+                    offsetMinutes: patch.offsetMinutes,
+                    timeOfDayOverride: patch.timeOfDayOverride || undefined,
+                    channel: patch.channel ?? r.channel,
+                  }
+                : r,
+            ),
+          ),
         }));
         await get().refreshCar(carId);
+        return true;
       },
 
       removeReminder: async (carId, reminderId) => {
@@ -322,6 +376,67 @@ export const useStore = create<StoreState>()(
           ),
         }));
         await get().refreshCar(carId);
+      },
+
+      addDefaultReminder: (preset) => {
+        const s = get();
+        if (s.loadError || hasTiming(s.defaultReminders, preset)) return false;
+        set({
+          defaultReminders: [
+            ...s.defaultReminders,
+            {
+              id: uid('def'),
+              label: preset.label,
+              offsetMinutes: preset.offsetMinutes,
+              timeOfDayOverride: preset.timeOfDayOverride || undefined,
+              channel: preset.channel,
+            },
+          ],
+        });
+        return true;
+      },
+
+      updateDefaultReminder: (id, patch) => {
+        const s = get();
+        if (s.loadError || !s.defaultReminders.some((d) => d.id === id)) return false;
+        if (hasTiming(s.defaultReminders, patch, id)) return false;
+        set({
+          defaultReminders: s.defaultReminders.map((d) =>
+            d.id === id
+              ? {
+                  ...d,
+                  label: patch.label,
+                  offsetMinutes: patch.offsetMinutes,
+                  timeOfDayOverride: patch.timeOfDayOverride || undefined,
+                  channel: patch.channel ?? d.channel,
+                }
+              : d,
+          ),
+        });
+        return true;
+      },
+
+      removeDefaultReminder: (id) => {
+        if (get().loadError) return;
+        set((s) => ({ defaultReminders: s.defaultReminders.filter((d) => d.id !== id) }));
+      },
+
+      setDefaultReminderChannel: (id, channel) => {
+        if (get().loadError) return;
+        set((s) => ({ defaultReminders: s.defaultReminders.map((d) => (d.id === id ? { ...d, channel } : d)) }));
+      },
+
+      applyDefaultsToAllCars: async () => {
+        if (get().loadError) return false; // see addCar
+        const defaults = get().defaultReminders;
+        set((s) => ({ cars: s.cars.map((c) => ({ ...c, reminders: remindersFrom(c.id, defaults) })) }));
+        // Per car (like the reminder CRUD actions) rather than refreshAll: a
+        // non-forced refreshAll could piggyback on an in-flight one that already
+        // synced some cars with their old reminders.
+        for (const c of get().cars) {
+          await get().refreshCar(c.id);
+        }
+        return true;
       },
 
       refreshCar: async (carId, force = false) => {
@@ -392,8 +507,15 @@ export const useStore = create<StoreState>()(
       version: PERSIST_VERSION,
       storage: createJSONStorage(() => guardedStorage),
       // Only persist the durable domain data; derived fields are recomputed.
-      partialize: (s) => ({ theme: s.theme, showEmpty: s.showEmpty, seeded: s.seeded, cars: s.cars }),
-      // < v3 drops cached schedules; < v4 marks existing installs as seeded.
+      partialize: (s) => ({
+        theme: s.theme,
+        showEmpty: s.showEmpty,
+        seeded: s.seeded,
+        cars: s.cars,
+        defaultReminders: s.defaultReminders,
+      }),
+      // < v3 drops cached schedules; < v4 marks existing installs as seeded;
+      // < v5 adds the initial default reminders.
       migrate: (persisted, fromVersion) => migratePersisted(persisted, fromVersion) as StoreState,
       onRehydrateStorage: () => (_state, error) => {
         // Kick the engine once persisted state is back. This is the only init

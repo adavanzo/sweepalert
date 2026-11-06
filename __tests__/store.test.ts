@@ -83,15 +83,20 @@ async function launchReady(): Promise<StoreModule> {
   return m;
 }
 
-function persisted(): { state: { cars: Car[]; seeded: boolean }; version: number } | null {
+function persisted(): {
+  state: { cars: Car[]; seeded: boolean; defaultReminders?: { label: string }[] };
+  version: number;
+} | null {
   const raw = mockMem.get(KEY);
   return raw ? JSON.parse(raw) : null;
 }
 
-function savePersisted(state: Partial<{ cars: Car[]; seeded: boolean; showEmpty: boolean; theme: string }>) {
+type Saved = Partial<{ cars: Car[]; seeded: boolean; showEmpty: boolean; theme: string; defaultReminders: unknown[] }>;
+
+function savePersisted(state: Saved, version = 4) {
   mockMem.set(
     KEY,
-    JSON.stringify({ state: { theme: 'light', showEmpty: false, seeded: true, cars: [], ...state }, version: 4 }),
+    JSON.stringify({ state: { theme: 'light', showEmpty: false, seeded: true, cars: [], ...state }, version }),
   );
 }
 
@@ -284,5 +289,143 @@ describe('stale refresh results', () => {
     const a = m.useStore.getState().cars[0];
     expect(a.location).toEqual(spot);
     expect(a.schedule?.address).toBe('New St');
+  });
+});
+
+describe('default reminders', () => {
+  const night = { label: 'Night before at 8pm', offsetMinutes: 1440, timeOfDayOverride: '20:00' };
+
+  it('an old (v4) install migrates to the initial default, and addCar uses it', async () => {
+    savePersisted({ cars: [] }, 4);
+    const m = await launchReady();
+    expect(m.useStore.getState().defaultReminders).toEqual([expect.objectContaining({ ...night, channel: 'push' })]);
+    const id = (await m.useStore.getState().addCar({ name: 'new', color: '#fff' }))!;
+    const added = m.useStore.getState().cars.find((c) => c.id === id)!;
+    expect(added.reminders).toEqual([expect.objectContaining({ ...night, carId: id, enabled: true })]);
+    expect(persisted()?.version).toBe(5);
+    expect(persisted()?.state.defaultReminders?.map((d) => d.label)).toEqual(['Night before at 8pm']);
+  });
+
+  it('addCar copies the current defaults with fresh ids', async () => {
+    savePersisted({ cars: [] }, 5);
+    const m = await launchReady();
+    const s = m.useStore.getState();
+    expect(s.addDefaultReminder({ label: '1 hour before', offsetMinutes: 60, channel: 'alarm' })).toBe(true);
+    const a = (await s.addCar({ name: 'a', color: '#fff' }))!;
+    const b = (await s.addCar({ name: 'b', color: '#fff' }))!;
+    const ra = m.useStore.getState().cars.find((c) => c.id === a)!.reminders;
+    const rb = m.useStore.getState().cars.find((c) => c.id === b)!.reminders;
+    expect(ra.map((r) => r.label)).toEqual(['Night before at 8pm', '1 hour before']);
+    expect(ra[1].channel).toBe('alarm');
+    const ids = [...ra, ...rb].map((r) => r.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).not.toContain(m.useStore.getState().defaultReminders[0].id);
+  });
+
+  it('edits, recolors and removes defaults without touching existing cars', async () => {
+    savePersisted({ cars: [car('a')] }, 5);
+    const m = await launchReady();
+    const s = m.useStore.getState();
+    const d = s.defaultReminders[0];
+    expect(s.updateDefaultReminder(d.id, { label: '2 days before at 7pm', offsetMinutes: 2880, timeOfDayOverride: '19:00' })).toBe(true);
+    s.setDefaultReminderChannel(d.id, 'alarm');
+    expect(m.useStore.getState().defaultReminders[0]).toMatchObject({ label: '2 days before at 7pm', channel: 'alarm' });
+    expect(s.addDefaultReminder({ label: 'dup', offsetMinutes: 2880, timeOfDayOverride: '19:00', channel: 'push' })).toBe(false);
+    s.removeDefaultReminder(d.id);
+    expect(m.useStore.getState().defaultReminders).toEqual([]);
+    expect(m.useStore.getState().cars[0].reminders).toEqual([]);
+  });
+
+  it('applyDefaultsToAllCars replaces every car\'s reminders and resyncs each car', async () => {
+    const withReminder = (id: string): Car => ({
+      ...car(id, { schedule: sched('S') }),
+      reminders: [{ id: `${id}-old`, carId: id, label: '15 min before', offsetMinutes: 15, channel: 'push', enabled: false }],
+    });
+    savePersisted({ cars: [withReminder('a'), withReminder('b')] }, 5);
+    mockLookup.mockRejectedValue(new Error('offline')); // keep cached schedules
+    const m = await launchReady();
+    mockSync.mockClear();
+    await expect(m.useStore.getState().applyDefaultsToAllCars()).resolves.toBe(true);
+    const cars = m.useStore.getState().cars;
+    for (const c of cars) {
+      expect(c.reminders).toEqual([expect.objectContaining({ ...night, carId: c.id, enabled: true })]);
+    }
+    expect(cars[0].reminders[0].id).not.toBe(cars[1].reminders[0].id);
+    const synced = mockSync.mock.calls.map(([c]) => [c.id, c.reminders.map((r) => r.label)]);
+    expect(synced).toEqual([
+      ['a', ['Night before at 8pm']],
+      ['b', ['Night before at 8pm']],
+    ]);
+  });
+
+  it('defaults and apply are refused while saved state failed to load', async () => {
+    savePersisted({ cars: [car('real')] }, 5);
+    mockStorageCtl.failGet = true;
+    const m = launch();
+    await until(() => m.useStore.getState().loadError, 'loadError');
+    const s = m.useStore.getState();
+    expect(s.addDefaultReminder({ label: '1 hour before', offsetMinutes: 60, channel: 'push' })).toBe(false);
+    await expect(s.applyDefaultsToAllCars()).resolves.toBe(false);
+    expect(mockSetItem).not.toHaveBeenCalled();
+  });
+});
+
+describe('reminder editing', () => {
+  it('updateReminder changes the fire timing and resyncs', async () => {
+    const schedule = sched('S', '2099-05-07'); // a Thursday
+    savePersisted({
+      cars: [
+        {
+          ...car('a', { schedule }),
+          reminders: [{ id: 'r1', carId: 'a', label: '1 hour before', offsetMinutes: 60, channel: 'push', enabled: true }],
+        },
+      ],
+    }, 5);
+    mockLookup.mockRejectedValue(new Error('offline'));
+    const m = await launchReady();
+    mockSync.mockClear();
+    const ok = await m.useStore
+      .getState()
+      .updateReminder('a', 'r1', { label: '2 days before at 7pm', offsetMinutes: 2880, timeOfDayOverride: '19:00', channel: 'alarm' });
+    expect(ok).toBe(true);
+    const r = m.useStore.getState().cars[0].reminders[0];
+    expect(r).toMatchObject({ id: 'r1', label: '2 days before at 7pm', offsetMinutes: 2880, timeOfDayOverride: '19:00', channel: 'alarm' });
+
+    const { planCarNotifications } = jest.requireActual('../src/services/scheduling');
+    const synced: Car = mockSync.mock.calls[mockSync.mock.calls.length - 1][0];
+    const plan = planCarNotifications(synced, new Date());
+    const { DateTime } = jest.requireActual('luxon');
+    expect(DateTime.fromJSDate(plan[0].fireAt, { zone: schedule.timezone }).toFormat('yyyy-LL-dd HH:mm')).toBe(
+      '2099-05-05 19:00',
+    );
+
+    // Back to a plain offset clears the override.
+    await m.useStore.getState().updateReminder('a', 'r1', { label: '30 min before', offsetMinutes: 30 });
+    expect(m.useStore.getState().cars[0].reminders[0].timeOfDayOverride).toBeUndefined();
+    expect(m.useStore.getState().cars[0].reminders[0].channel).toBe('alarm'); // kept when omitted
+  });
+
+  it('prevents exact duplicates on one car (add and update)', async () => {
+    savePersisted({
+      cars: [
+        {
+          ...car('a'),
+          reminders: [
+            { id: 'r1', carId: 'a', label: 'Night before at 8pm', offsetMinutes: 1440, timeOfDayOverride: '20:00', channel: 'push', enabled: true },
+            { id: 'r2', carId: 'a', label: '1 hour before', offsetMinutes: 60, channel: 'push', enabled: true },
+          ],
+        },
+      ],
+    }, 5);
+    const m = await launchReady();
+    const s = m.useStore.getState();
+    await expect(s.addReminder('a', { label: 'again', offsetMinutes: 1440, timeOfDayOverride: '20:00', channel: 'alarm' })).resolves.toBe(false);
+    await expect(s.addReminder('a', { label: '1 hour before', offsetMinutes: 60, channel: 'push' })).resolves.toBe(false);
+    // Same offset, different override (1 day before vs night before) is not a duplicate.
+    await expect(s.addReminder('a', { label: '1 day before', offsetMinutes: 1440, channel: 'push' })).resolves.toBe(true);
+    await expect(s.updateReminder('a', 'r2', { label: 'x', offsetMinutes: 1440, timeOfDayOverride: '20:00' })).resolves.toBe(false);
+    // Saving a reminder with its own unchanged timing is fine.
+    await expect(s.updateReminder('a', 'r2', { label: '1 hour before', offsetMinutes: 60, channel: 'alarm' })).resolves.toBe(true);
+    expect(m.useStore.getState().cars[0].reminders.map((r) => r.label)).toEqual(['Night before at 8pm', '1 hour before', '1 day before']);
   });
 });
